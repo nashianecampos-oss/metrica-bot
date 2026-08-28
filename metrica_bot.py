@@ -9,7 +9,7 @@ from googleapiclient.discovery import build
 from google.oauth2 import service_account
 
 # ─── CONFIGURAÇÕES ───────────────────────────────────────────
-BOT_TOKEN = "8713718165:AAGdwcBHqaTeH6P91yuJTz4XxbqHbTk-IAs"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GRUPO_EQUIPE = "-1004373927366"
 GRUPO_PRIVADO = "-1004404379489"
 THREAD_RELATORIOS = 19
