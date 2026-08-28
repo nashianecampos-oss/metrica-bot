@@ -1,1 +1,1 @@
-worker: python checkin_bot.py
+worker: python metrica_bot.py
