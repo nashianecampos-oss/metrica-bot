@@ -280,6 +280,36 @@ def loop_webhook():
     print(f"🌐 Webhook HTTP rodando na porta {PORT}")
     server.serve_forever()
 
+def loop_verificar_clickup_sem_inicio():
+    """Verifica a cada 30min se alguém tem atividade no ClickUp sem ter dado /iniciar"""
+    while True:
+        time.sleep(1800)  # verifica a cada 30min
+        try:
+            agora = datetime.now(MANAUS)
+            if agora.weekday() == 6 or agora.hour < 7 or agora.hour >= 21:
+                continue
+
+            inicio_dia = int(agora.replace(hour=0, minute=0, second=0).timestamp() * 1000)
+
+            for telegram_id, config in EQUIPE.items():
+                if telegram_id == 2048504320:  # Nagia não precisa verificar
+                    continue
+                if telegram_id in drive_monitorando:  # já iniciou
+                    continue
+
+                clickup_id = config["clickup_id"]
+                mention = config["mention"]
+
+                data = clickup_get(f"team/{WORKSPACE_CLICKUP}/time_entries?assignee={clickup_id}&start_date={inicio_dia}&end_date={int(agora.timestamp()*1000)}")
+                entries = data.get("data", [])
+
+                if entries:
+                    enviar_telegram(GRUPO_EQUIPE, None,
+                                   f"⚠️ {mention}, detectei atividade no ClickUp hoje "
+                                   f"mas você não marcou início. Use /iniciar!")
+        except Exception as e:
+            print(f"Erro verificar clickup sem inicio: {e}")
+
 # ─── GOOGLE DRIVE ─────────────────────────────────────────────
 def get_caminho_drive(drive, parents):
     partes = []
@@ -345,6 +375,14 @@ def loop_drive(drive):
                                        f"📁 *{nome}* - Primeira atividade Drive: {hora}\n_{caminho} / {nome_arquivo}_")
                     atividades["ultima"] = info
                     drive_atividades[telegram_id] = atividades
+                elif telegram_id and telegram_id not in drive_monitorando:
+                    # Atividade no Drive sem /iniciar
+                    agora_manaus = datetime.now(MANAUS)
+                    if agora_manaus.weekday() < 6 and 7 <= agora_manaus.hour < 21:
+                        mention = EQUIPE[telegram_id]["mention"]
+                        enviar_telegram(GRUPO_EQUIPE, None,
+                                       f"⚠️ {mention}, detectei atividade no Drive às {hora} "
+                                       f"mas você não marcou início. Use /iniciar!")
 
             ultimo_check = agora
             if len(arquivos_vistos) > 2000:
@@ -487,6 +525,14 @@ def processar_mensagem(msg, sheets):
     texto_lower = texto.lower()
 
     if texto_lower == "/iniciar":
+        # Aviso de duplicado
+        if user_id in registros and "entrada" in registros[user_id]:
+            hora_entrada = registros[user_id]["entrada"].strftime("%H:%M")
+            enviar_telegram(GRUPO_EQUIPE, None,
+                           f"⚠️ {mention}, você já iniciou às {hora_entrada}.\n"
+                           f"Use /encerrando primeiro se quiser encerrar o expediente atual.")
+            return
+
         if user_id not in registros:
             registros[user_id] = {}
         registros[user_id]["entrada"] = agora
@@ -494,11 +540,24 @@ def processar_mensagem(msg, sheets):
         drive_monitorando[user_id] = True
         drive_atividades[user_id] = {"primeira": None, "ultima": None}
         enviar_telegram(GRUPO_EQUIPE, None, f"✅ *{nome}* iniciou às {agora.strftime('%H:%M')}")
+
+        # Verifica ClickUp após 5min
         def checar_clickup_inicio():
             time.sleep(300)
             if user_id in drive_monitorando:
                 verificar_clickup_inicio(user_id)
         threading.Thread(target=checar_clickup_inicio, daemon=True).start()
+
+        # Verifica Drive após 45min
+        def checar_drive_inicio():
+            time.sleep(2700)
+            if user_id in drive_monitorando:
+                atividades = drive_atividades.get(user_id, {})
+                if not atividades.get("primeira"):
+                    enviar_telegram(GRUPO_EQUIPE, None,
+                                   f"⚠️ {mention}, você iniciou há 45 minutos mas ainda não há "
+                                   f"nenhuma atividade registrada no Drive!")
+        threading.Thread(target=checar_drive_inicio, daemon=True).start()
 
     elif texto_lower == "/encerrando":
         if user_id not in registros or "entrada" not in registros[user_id]:
@@ -586,6 +645,7 @@ def main():
 
     threading.Thread(target=loop_drive, args=(drive,), daemon=True).start()
     threading.Thread(target=loop_webhook, daemon=True).start()
+    threading.Thread(target=loop_verificar_clickup_sem_inicio, daemon=True).start()
 
     offset = None
     relatorio_enviado = False
