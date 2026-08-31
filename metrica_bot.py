@@ -134,18 +134,19 @@ def clickup_get(endpoint):
     return r.json()
 
 def get_pasta_id_da_tarefa(task_id):
-    """Retorna o folder_id da tarefa"""
+    """Retorna o folder_id da tarefa usando project.id"""
     try:
         task = clickup_get(f"task/{task_id}")
-        list_id = task.get("list", {}).get("id")
-        if not list_id:
-            return None
-        lst = clickup_get(f"list/{list_id}")
-        folder = lst.get("folder", {})
-        if folder.get("hidden"):
-            return None
-        return str(folder.get("id"))
-    except:
+        # project.id é o folder_id
+        project = task.get("project", {})
+        if not project.get("hidden", True):
+            return str(project.get("id"))
+        folder = task.get("folder", {})
+        if not folder.get("hidden", True):
+            return str(folder.get("id"))
+        return None
+    except Exception as e:
+        print(f"Erro get_pasta: {e}")
         return None
 
 def notificar_tarefa_criada(task_data):
