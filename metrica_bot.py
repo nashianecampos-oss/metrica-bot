@@ -253,9 +253,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         task_id = history[0].get("parent_id")
                 if task_id:
                     print(f"Task ID: {task_id}")
-                    # Busca dados completos da tarefa
                     def processar_task():
                         try:
+                            time.sleep(20)  # aguarda 20s para tarefa ser configurada
                             task_data = clickup_get(f"task/{task_id}")
                             notificar_tarefa_criada(task_data)
                         except Exception as e:
