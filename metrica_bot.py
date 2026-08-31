@@ -343,7 +343,8 @@ def buscar_arquivos_drive(drive, desde):
 
 def loop_drive(drive):
     global arquivos_vistos
-    ultimo_check = datetime.now(MANAUS) - timedelta(minutes=2)
+    ultimo_check = datetime.now(MANAUS)  # ignora histórico anterior ao deploy
+    print(f"📁 Drive monitorando a partir de {ultimo_check.strftime('%H:%M')}")
     while True:
         try:
             agora = datetime.now(MANAUS)
@@ -376,13 +377,17 @@ def loop_drive(drive):
                     atividades["ultima"] = info
                     drive_atividades[telegram_id] = atividades
                 elif telegram_id and telegram_id not in drive_monitorando:
-                    # Atividade no Drive sem /iniciar
+                    # Atividade no Drive sem /iniciar — avisa só uma vez por dia
                     agora_manaus = datetime.now(MANAUS)
                     if agora_manaus.weekday() < 6 and 7 <= agora_manaus.hour < 21:
-                        mention = EQUIPE[telegram_id]["mention"]
-                        enviar_telegram(GRUPO_EQUIPE, None,
-                                       f"⚠️ {mention}, detectei atividade no Drive às {hora} "
-                                       f"mas você não marcou início. Use /iniciar!")
+                        data_hoje = agora_manaus.strftime("%d/%m/%Y")
+                        chave = f"aviso_drive_{telegram_id}_{data_hoje}"
+                        if chave not in arquivos_vistos:
+                            arquivos_vistos.add(chave)
+                            mention = EQUIPE[telegram_id]["mention"]
+                            enviar_telegram(GRUPO_EQUIPE, None,
+                                           f"⚠️ {mention}, detectei atividade no Drive às {hora} "
+                                           f"mas você não marcou início. Use /iniciar!")
 
             ultimo_check = agora
             if len(arquivos_vistos) > 2000:
