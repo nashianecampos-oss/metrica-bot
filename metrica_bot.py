@@ -153,9 +153,15 @@ def notificar_tarefa_criada(task_data):
     """Processa webhook de tarefa criada"""
     task_id = task_data.get("id")
     task_name = task_data.get("name", "Sem nome")
-    task_url = f"https://app.clickup.com/t/{task_id}"
+    task_url = task_data.get("url", f"https://app.clickup.com/t/{task_id}")
     assignees = task_data.get("assignees", [])
     responsavel = assignees[0].get("username", "Não atribuído") if assignees else "Não atribuído"
+
+    # Ignora tarefas com status OBJETIVO
+    status = task_data.get("status", {}).get("status", "").upper()
+    if "OBJETIVO" in status:
+        print(f"Ignorando tarefa com status OBJETIVO: {task_name}")
+        return
 
     pasta_id = get_pasta_id_da_tarefa(task_id)
     if not pasta_id:
