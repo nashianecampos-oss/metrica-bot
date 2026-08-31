@@ -234,12 +234,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
+        print(f"WEBHOOK RECEBIDO: {body.decode('utf-8')[:500]}")
 
         try:
             data = json.loads(body)
             event = data.get("event")
+            print(f"Evento: {event}")
             if event == "taskCreated":
                 task_data = data.get("task", {})
+                print(f"Task ID: {task_data.get('id')}, Nome: {task_data.get('name')}")
                 threading.Thread(
                     target=notificar_tarefa_criada,
                     args=(task_data,),
