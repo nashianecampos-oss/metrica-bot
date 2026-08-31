@@ -234,12 +234,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
-        print(f"WEBHOOK RECEBIDO: {body.decode('utf-8')[:500]}")
 
         try:
             data = json.loads(body)
             event = data.get("event")
-            print(f"Evento: {event}")
             if event == "taskCreated":
                 # ClickUp envia task_id em history_items, não em task{}
                 task_id = data.get("task_id")
