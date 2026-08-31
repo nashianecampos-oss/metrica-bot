@@ -241,13 +241,24 @@ class WebhookHandler(BaseHTTPRequestHandler):
             event = data.get("event")
             print(f"Evento: {event}")
             if event == "taskCreated":
-                task_data = data.get("task", {})
-                print(f"Task ID: {task_data.get('id')}, Nome: {task_data.get('name')}")
-                threading.Thread(
-                    target=notificar_tarefa_criada,
-                    args=(task_data,),
-                    daemon=True
-                ).start()
+                # ClickUp envia task_id em history_items, não em task{}
+                task_id = data.get("task_id")
+                if not task_id:
+                    history = data.get("history_items", [])
+                    if history:
+                        task_id = history[0].get("parent_id")
+                if task_id:
+                    print(f"Task ID: {task_id}")
+                    # Busca dados completos da tarefa
+                    def processar_task():
+                        try:
+                            task_data = clickup_get(f"task/{task_id}")
+                            notificar_tarefa_criada(task_data)
+                        except Exception as e:
+                            print(f"Erro ao buscar tarefa: {e}")
+                    threading.Thread(target=processar_task, daemon=True).start()
+                else:
+                    print("Task ID não encontrado no payload")
         except Exception as e:
             print(f"Erro webhook: {e}")
 
