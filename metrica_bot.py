@@ -53,7 +53,7 @@ EQUIPE = {
         "intervalo_h": 1,
         "carga_diaria_h": 8,
         "clickup_id": 84120914,
-        "drive_name": None,
+        "drive_name": "helena.metricabim",
     },
 }
 
