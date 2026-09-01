@@ -96,6 +96,31 @@ drive_monitorando = {}
 encerrou_hoje = set()  # {telegram_id} — quem já trabalhou e encerrou hoje
 arquivos_vistos = set()
 
+def ja_encerrou_hoje(user_id, sheets):
+    """Verifica na planilha se a pessoa já registrou saída hoje"""
+    try:
+        agora = datetime.now(MANAUS)
+        data_hoje = agora.strftime("%d/%m/%Y")
+        nome_aba = agora.strftime("%m-%Y")
+        resultado = sheets.spreadsheets().values().get(
+            spreadsheetId=PLANILHA_ID,
+            range=f"'{nome_aba}'!A:A"
+        ).execute()
+        datas = [r[0] if r else "" for r in resultado.get("values", [])]
+        if data_hoje not in datas:
+            return False
+        linha_idx = datas.index(data_hoje)
+        pos = ORDEM_PLANILHA.index(user_id)
+        col_saida = 1 + pos * COLUNAS_POR_PESSOA + 1  # coluna Saída (0-based)
+        resultado2 = sheets.spreadsheets().values().get(
+            spreadsheetId=PLANILHA_ID,
+            range=f"'{nome_aba}'!{col_letra(col_saida)}{linha_idx + 1}"
+        ).execute()
+        valores = resultado2.get("values", [])
+        return bool(valores and valores[0])
+    except:
+        return False
+
 # ─── CREDENCIAIS ─────────────────────────────────────────────
 def carregar_credenciais():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
@@ -281,7 +306,7 @@ def loop_webhook():
     print(f"🌐 Webhook HTTP rodando na porta {PORT}")
     server.serve_forever()
 
-def loop_verificar_clickup_sem_inicio():
+def loop_verificar_clickup_sem_inicio(sheets):
     """Verifica a cada 30min se alguém tem atividade no ClickUp sem ter dado /iniciar"""
     avisos_enviados = set()
     while True:
@@ -300,9 +325,13 @@ def loop_verificar_clickup_sem_inicio():
             for telegram_id, config in EQUIPE.items():
                 if telegram_id == 2048504320:
                     continue
-                if telegram_id in drive_monitorando:  # está trabalhando agora
+                if telegram_id in drive_monitorando:
                     continue
-                if telegram_id in encerrou_hoje:  # já trabalhou e encerrou
+                if telegram_id in encerrou_hoje:
+                    continue
+                # Verifica na planilha se já encerrou hoje (sobrevive a reinícios)
+                if ja_encerrou_hoje(telegram_id, sheets):
+                    encerrou_hoje.add(telegram_id)
                     continue
 
                 chave = f"{telegram_id}_{data_hoje}"
@@ -354,7 +383,7 @@ def buscar_arquivos_drive(drive, desde):
     ).execute()
     return resultado.get("files", [])
 
-def loop_drive(drive):
+def loop_drive(drive, sheets):
     global arquivos_vistos
     ultimo_check = datetime.now(MANAUS)  # ignora histórico anterior ao deploy
     print(f"📁 Drive monitorando a partir de {ultimo_check.strftime('%H:%M')}")
@@ -390,8 +419,11 @@ def loop_drive(drive):
                     atividades["ultima"] = info
                     drive_atividades[telegram_id] = atividades
                 elif telegram_id and telegram_id not in drive_monitorando:
-                    # Atividade no Drive sem /iniciar — ignora quem já encerrou hoje
                     if telegram_id in encerrou_hoje:
+                        continue
+                    # Verifica na planilha se já encerrou hoje (sobrevive a reinícios)
+                    if ja_encerrou_hoje(telegram_id, sheets):
+                        encerrou_hoje.add(telegram_id)
                         continue
                     agora_manaus = datetime.now(MANAUS)
                     if agora_manaus.weekday() < 6 and 7 <= agora_manaus.hour < 21:
@@ -668,9 +700,9 @@ def main():
     drive, sheets = autenticar_google()
     print("✅ Google conectado")
 
-    threading.Thread(target=loop_drive, args=(drive,), daemon=True).start()
+    threading.Thread(target=loop_drive, args=(drive, sheets), daemon=True).start()
     threading.Thread(target=loop_webhook, daemon=True).start()
-    threading.Thread(target=loop_verificar_clickup_sem_inicio, daemon=True).start()
+    threading.Thread(target=loop_verificar_clickup_sem_inicio, args=(sheets,), daemon=True).start()
 
     offset = None
     relatorio_enviado = False
