@@ -282,19 +282,28 @@ def loop_webhook():
 
 def loop_verificar_clickup_sem_inicio():
     """Verifica a cada 30min se alguém tem atividade no ClickUp sem ter dado /iniciar"""
+    avisos_enviados = set()  # controla quem já foi avisado hoje
     while True:
-        time.sleep(1800)  # verifica a cada 30min
+        time.sleep(1800)
         try:
             agora = datetime.now(MANAUS)
             if agora.weekday() == 6 or agora.hour < 7 or agora.hour >= 21:
+                # Limpa avisos à meia-noite
+                if agora.hour == 0:
+                    avisos_enviados.clear()
                 continue
 
             inicio_dia = int(agora.replace(hour=0, minute=0, second=0).timestamp() * 1000)
+            data_hoje = agora.strftime("%d/%m/%Y")
 
             for telegram_id, config in EQUIPE.items():
-                if telegram_id == 2048504320:  # Nagia não precisa verificar
+                if telegram_id == 2048504320:
                     continue
-                if telegram_id in drive_monitorando:  # já iniciou
+                if telegram_id in drive_monitorando:
+                    continue
+
+                chave = f"{telegram_id}_{data_hoje}"
+                if chave in avisos_enviados:
                     continue
 
                 clickup_id = config["clickup_id"]
@@ -304,6 +313,7 @@ def loop_verificar_clickup_sem_inicio():
                 entries = data.get("data", [])
 
                 if entries:
+                    avisos_enviados.add(chave)
                     enviar_telegram(GRUPO_EQUIPE, None,
                                    f"⚠️ {mention}, detectei atividade no ClickUp hoje "
                                    f"mas você não marcou início. Use /iniciar!")
@@ -617,53 +627,6 @@ def processar_mensagem(msg, sheets):
         enviar_telegram(GRUPO_EQUIPE, None,
                        f"⭐ *{nome}* encerrou hora extra\n⏱ Extra: *{extra_h}h{extra_m:02d}min*")
 
-# ─── RELATÓRIO HORAS EXTRAS ───────────────────────────────────
-def gerar_relatorio_horas_extras(sheets):
-    import calendar
-    agora = datetime.now(MANAUS)
-    nome_aba = agora.strftime("%m-%Y")
-    mes_str = agora.strftime("%m/%Y")
-
-    try:
-        resultado = sheets.spreadsheets().values().get(
-            spreadsheetId=PLANILHA_ID, range=f"'{nome_aba}'!A1:Z1000"
-        ).execute()
-        linhas = resultado.get("values", [])
-    except:
-        enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
-                       f"⚠️ Sem dados de extras para {mes_str}")
-        return
-
-    if len(linhas) <= 1:
-        enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
-                       f"⚠️ Sem registros de extras em {mes_str}")
-        return
-
-    relatorio = [f"⭐ *Horas extras — {mes_str}*\n"]
-
-    for i, uid in enumerate(ORDEM_PLANILHA):
-        if uid == 2048504320:  # Nagia não entra no relatório
-            continue
-        nome = EQUIPE[uid]["nome"]
-        col_extra = 1 + i * COLUNAS_POR_PESSOA + 5  # coluna Extra Total (0-based)
-
-        total_min = 0
-        for linha in linhas[1:]:  # pula cabeçalho
-            if len(linha) > col_extra and linha[col_extra]:
-                valor = linha[col_extra]  # formato "Xh00min"
-                try:
-                    h = int(valor.split("h")[0])
-                    m = int(valor.split("h")[1].replace("min", ""))
-                    total_min += h * 60 + m
-                except:
-                    pass
-
-        horas = total_min // 60
-        mins = total_min % 60
-        relatorio.append(f"👤 *{nome}*: {horas}h{mins:02d}min")
-
-    enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS, "\n".join(relatorio))
-
 # ─── RELATÓRIO MENSAL ─────────────────────────────────────────
 def gerar_relatorio_mensal(sheets):
     agora = datetime.now(MANAUS)
@@ -701,8 +664,6 @@ def main():
 
     offset = None
     relatorio_enviado = False
-    relatorio_extra_enviado = False
-    vencimentos_enviado = False
 
     while True:
         try:
@@ -717,123 +678,15 @@ def main():
                 if msg:
                     processar_mensagem(msg, sheets)
             agora = datetime.now(MANAUS)
-            import calendar
-            ultimo_dia_mes = calendar.monthrange(agora.year, agora.month)[1]
-
             if agora.day == 1 and agora.hour == 8 and agora.minute == 0:
                 if not relatorio_enviado:
                     gerar_relatorio_mensal(sheets)
                     relatorio_enviado = True
             else:
                 relatorio_enviado = False
-
-            if agora.day == ultimo_dia_mes and agora.hour == 16 and agora.minute == 0:
-                if not relatorio_extra_enviado:
-                    gerar_relatorio_horas_extras(sheets)
-                    relatorio_extra_enviado = True
-            else:
-                relatorio_extra_enviado = False
-
-            if agora.hour == 13 and agora.minute == 0 and agora.weekday() < 6:
-                if not vencimentos_enviado:
-                    threading.Thread(target=verificar_vencimentos, args=(sheets,), daemon=True).start()
-                    vencimentos_enviado = True
-            else:
-                vencimentos_enviado = False
         except Exception as e:
             print(f"Erro main: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
     main()
-
-# ─── VERIFICAÇÃO DE VENCIMENTOS ───────────────────────────────
-def verificar_vencimentos(sheets):
-    """Verifica tarefas vencendo hoje, amanhã e já vencidas às 13h"""
-    try:
-        agora = datetime.now(MANAUS)
-        hoje = agora.date()
-        amanha = hoje + timedelta(days=1)
-
-        # Busca todas as listas de todos os espaços mapeados
-        pastas_ids = list(PASTA_PARA_TOPICO.keys())
-
-        for pasta_id, destino in PASTA_PARA_TOPICO.items():
-            try:
-                # Busca listas dentro da pasta
-                listas = clickup_get(f"folder/{pasta_id}/list")
-                for lista in listas.get("lists", []):
-                    lista_id = lista["id"]
-
-                    # Busca tarefas com due date
-                    tarefas = clickup_get(
-                        f"list/{lista_id}/task?due_date_gt=0&include_closed=false"
-                    )
-
-                    for task in tarefas.get("tasks", []):
-                        # Ignora status OBJETIVO e CONCLUÍDO
-                        status = task.get("status", {}).get("status", "").upper()
-                        if "OBJETIVO" in status or "CONCLU" in status:
-                            continue
-
-                        due_date = task.get("due_date")
-                        if not due_date:
-                            continue
-
-                        task_name = task.get("name", "Sem nome")
-                        task_url = task.get("url", f"https://app.clickup.com/t/{task['id']}")
-                        due_date_dt = datetime.fromtimestamp(int(due_date) / 1000, tz=MANAUS).date()
-
-                        # Pega último modificador
-                        ultimo_modificador_id = task.get("creator", {}).get("id")
-                        ultimo_modificador_nome = task.get("creator", {}).get("username", "Responsável")
-
-                        # Tenta pegar quem modificou por último via assignees
-                        assignees = task.get("assignees", [])
-                        if assignees:
-                            ultimo_modificador_nome = assignees[-1].get("username", ultimo_modificador_nome)
-                            ultimo_modificador_id = assignees[-1].get("id", ultimo_modificador_id)
-
-                        # Mapeia ClickUp ID → Telegram mention
-                        mention = None
-                        for tid, config in EQUIPE.items():
-                            if config["clickup_id"] == ultimo_modificador_id:
-                                mention = config["mention"]
-                                break
-                        if not mention:
-                            mention = f"*{ultimo_modificador_nome}*"
-
-                        # Monta mensagem conforme situação
-                        if due_date_dt == amanha:
-                            mensagem = (
-                                f"⏰ *Tarefa vencendo amanhã!*\n"
-                                f"📌 {task_name}\n"
-                                f"👤 {mention}\n"
-                                f"🔗 [Abrir no ClickUp]({task_url})"
-                            )
-                            enviar_telegram(destino["chat_id"], destino["thread_id"], mensagem)
-
-                        elif due_date_dt == hoje:
-                            mensagem = (
-                                f"🚨 *Tarefa vence hoje!*\n"
-                                f"📌 {task_name}\n"
-                                f"👤 {mention}\n"
-                                f"🔗 [Abrir no ClickUp]({task_url})"
-                            )
-                            enviar_telegram(destino["chat_id"], destino["thread_id"], mensagem)
-
-                        elif due_date_dt < hoje:
-                            venceu_em = due_date_dt.strftime("%d/%m")
-                            mensagem = (
-                                f"❌ *Tarefa vencida!*\n"
-                                f"📌 {task_name} — venceu em {venceu_em}\n"
-                                f"👤 {mention}\n"
-                                f"🔗 [Abrir no ClickUp]({task_url})"
-                            )
-                            enviar_telegram(destino["chat_id"], destino["thread_id"], mensagem)
-
-            except Exception as e:
-                print(f"Erro pasta {pasta_id}: {e}")
-
-    except Exception as e:
-        print(f"Erro verificar_vencimentos: {e}")
