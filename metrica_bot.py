@@ -93,6 +93,7 @@ COLUNAS_POR_PESSOA = 6
 registros = {}
 drive_atividades = {}
 drive_monitorando = {}
+encerrou_hoje = set()  # {telegram_id} — quem já trabalhou e encerrou hoje
 arquivos_vistos = set()
 
 # ─── CREDENCIAIS ─────────────────────────────────────────────
@@ -282,15 +283,15 @@ def loop_webhook():
 
 def loop_verificar_clickup_sem_inicio():
     """Verifica a cada 30min se alguém tem atividade no ClickUp sem ter dado /iniciar"""
-    avisos_enviados = set()  # controla quem já foi avisado hoje
+    avisos_enviados = set()
     while True:
         time.sleep(1800)
         try:
             agora = datetime.now(MANAUS)
             if agora.weekday() == 6 or agora.hour < 7 or agora.hour >= 21:
-                # Limpa avisos à meia-noite
                 if agora.hour == 0:
                     avisos_enviados.clear()
+                    encerrou_hoje.clear()
                 continue
 
             inicio_dia = int(agora.replace(hour=0, minute=0, second=0).timestamp() * 1000)
@@ -299,7 +300,9 @@ def loop_verificar_clickup_sem_inicio():
             for telegram_id, config in EQUIPE.items():
                 if telegram_id == 2048504320:
                     continue
-                if telegram_id in drive_monitorando:
+                if telegram_id in drive_monitorando:  # está trabalhando agora
+                    continue
+                if telegram_id in encerrou_hoje:  # já trabalhou e encerrou
                     continue
 
                 chave = f"{telegram_id}_{data_hoje}"
@@ -387,7 +390,9 @@ def loop_drive(drive):
                     atividades["ultima"] = info
                     drive_atividades[telegram_id] = atividades
                 elif telegram_id and telegram_id not in drive_monitorando:
-                    # Atividade no Drive sem /iniciar — avisa só uma vez por dia
+                    # Atividade no Drive sem /iniciar — ignora quem já encerrou hoje
+                    if telegram_id in encerrou_hoje:
+                        continue
                     agora_manaus = datetime.now(MANAUS)
                     if agora_manaus.weekday() < 6 and 7 <= agora_manaus.hour < 21:
                         data_hoje = agora_manaus.strftime("%d/%m/%Y")
@@ -402,6 +407,7 @@ def loop_drive(drive):
             ultimo_check = agora
             if len(arquivos_vistos) > 2000:
                 arquivos_vistos.clear()
+                encerrou_hoje.clear()
         except Exception as e:
             print(f"Erro drive: {e}")
         time.sleep(60)
@@ -483,8 +489,11 @@ def salvar_extra(sheets, data, user_id, entrada_extra, saida_extra, extra_min):
 
 # ─── PROCESSAMENTO DE MENSAGENS ───────────────────────────────
 def calcular_intervalo(user_id, minutos_trabalhados):
-    if user_id == 6488820892:
+    if user_id == 6488820892:  # Erick: desconta 1h só se trabalhar mais de 6h
         return 60 if minutos_trabalhados > 360 else 0
+    # Helena e Micheli: só desconta intervalo se trabalhar mais de 6h
+    if minutos_trabalhados <= 360:
+        return 0
     intervalo = EQUIPE[user_id].get("intervalo_h") or 0
     return intervalo * 60
 
@@ -558,7 +567,7 @@ def processar_mensagem(msg, sheets):
 
         # Verifica ClickUp após 5min
         def checar_clickup_inicio():
-            time.sleep(300)
+            time.sleep(900)  # 15 minutos
             if user_id in drive_monitorando:
                 verificar_clickup_inicio(user_id)
         threading.Thread(target=checar_clickup_inicio, daemon=True).start()
@@ -585,6 +594,7 @@ def processar_mensagem(msg, sheets):
         horas = minutos_liquidos // 60
         mins = minutos_liquidos % 60
         drive_monitorando.pop(user_id, None)
+        encerrou_hoje.add(user_id)
         ultima_drive = drive_atividades.get(user_id, {}).get("ultima")
         msg_drive = f"\n📁 Última atividade Drive: {ultima_drive['hora']}\n_{ultima_drive['arquivo']}_" if ultima_drive else ""
         try:
