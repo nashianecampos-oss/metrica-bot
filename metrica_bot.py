@@ -638,6 +638,17 @@ def processar_mensagem(msg, sheets):
         drive_atividades[user_id] = {"primeira": None, "ultima": None}
         enviar_telegram(GRUPO_EQUIPE, None, f"✅ *{nome}* iniciou às {agora.strftime('%H:%M')}")
 
+        # Salva entrada na planilha imediatamente
+        try:
+            nome_aba = agora.strftime("%m-%Y")
+            garantir_aba(sheets, nome_aba)
+            linha = get_ou_criar_linha(sheets, nome_aba, agora.strftime("%d/%m/%Y"))
+            pos = ORDEM_PLANILHA.index(user_id)
+            col_entrada = 1 + pos * COLUNAS_POR_PESSOA
+            atualizar_celulas(sheets, nome_aba, linha, col_entrada, [agora.strftime("%H:%M")])
+        except Exception as e:
+            print(f"Erro ao salvar entrada: {e}")
+
         # Verifica ClickUp após 5min
         def checar_clickup_inicio():
             time.sleep(900)  # 15 minutos
