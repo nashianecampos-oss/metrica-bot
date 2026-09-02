@@ -212,6 +212,13 @@ def verificar_clickup_inicio(telegram_id):
     mention = config["mention"]
     agora = datetime.now(MANAUS)
     inicio_dia = int(agora.replace(hour=0, minute=0, second=0).timestamp() * 1000)
+
+    # Verifica se tem timer rodando agora
+    timer_rodando = clickup_get(f"team/{WORKSPACE_CLICKUP}/time_entries/current?assignee={clickup_id}")
+    if timer_rodando.get("data"):
+        return  # timer ativo, não avisa
+
+    # Verifica time entries registradas hoje
     data = clickup_get(f"team/{WORKSPACE_CLICKUP}/time_entries?assignee={clickup_id}&start_date={inicio_dia}&end_date={int(agora.timestamp()*1000)}")
     if not data.get("data"):
         enviar_telegram(GRUPO_EQUIPE, None,
@@ -340,6 +347,11 @@ def loop_verificar_clickup_sem_inicio(sheets):
 
                 clickup_id = config["clickup_id"]
                 mention = config["mention"]
+
+                # Verifica se tem timer rodando agora
+                timer = clickup_get(f"team/{WORKSPACE_CLICKUP}/time_entries/current?assignee={clickup_id}")
+                if timer.get("data"):
+                    continue  # timer ativo, não avisa
 
                 data = clickup_get(f"team/{WORKSPACE_CLICKUP}/time_entries?assignee={clickup_id}&start_date={inicio_dia}&end_date={int(agora.timestamp()*1000)}")
                 entries = data.get("data", [])
