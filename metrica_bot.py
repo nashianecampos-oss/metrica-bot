@@ -121,6 +121,31 @@ def ja_encerrou_hoje(user_id, sheets):
     except:
         return False
 
+def ja_iniciou_hoje(user_id, sheets):
+    """Verifica na planilha se a pessoa já registrou entrada hoje"""
+    try:
+        agora = datetime.now(MANAUS)
+        data_hoje = agora.strftime("%d/%m/%Y")
+        nome_aba = agora.strftime("%m-%Y")
+        resultado = sheets.spreadsheets().values().get(
+            spreadsheetId=PLANILHA_ID,
+            range=f"'{nome_aba}'!A:A"
+        ).execute()
+        datas = [r[0] if r else "" for r in resultado.get("values", [])]
+        if data_hoje not in datas:
+            return False
+        linha_idx = datas.index(data_hoje)
+        pos = ORDEM_PLANILHA.index(user_id)
+        col_entrada = 1 + pos * COLUNAS_POR_PESSOA  # coluna Entrada
+        resultado2 = sheets.spreadsheets().values().get(
+            spreadsheetId=PLANILHA_ID,
+            range=f"'{nome_aba}'!{col_letra(col_entrada)}{linha_idx + 1}"
+        ).execute()
+        valores = resultado2.get("values", [])
+        return bool(valores and valores[0])
+    except:
+        return False
+
 # ─── CREDENCIAIS ─────────────────────────────────────────────
 def carregar_credenciais():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
@@ -336,10 +361,12 @@ def loop_verificar_clickup_sem_inicio(sheets):
                     continue
                 if telegram_id in encerrou_hoje:
                     continue
-                # Verifica na planilha se já encerrou hoje (sobrevive a reinícios)
+                # Verifica na planilha se já encerrou ou iniciou hoje (sobrevive a reinícios)
                 if ja_encerrou_hoje(telegram_id, sheets):
                     encerrou_hoje.add(telegram_id)
                     continue
+                if ja_iniciou_hoje(telegram_id, sheets):
+                    continue  # já iniciou hoje, não avisa
 
                 chave = f"{telegram_id}_{data_hoje}"
                 if chave in avisos_enviados:
@@ -433,10 +460,12 @@ def loop_drive(drive, sheets):
                 elif telegram_id and telegram_id not in drive_monitorando:
                     if telegram_id in encerrou_hoje:
                         continue
-                    # Verifica na planilha se já encerrou hoje (sobrevive a reinícios)
+                    # Verifica na planilha se já encerrou ou iniciou hoje (sobrevive a reinícios)
                     if ja_encerrou_hoje(telegram_id, sheets):
                         encerrou_hoje.add(telegram_id)
                         continue
+                    if ja_iniciou_hoje(telegram_id, sheets):
+                        continue  # já iniciou hoje, não avisa
                     agora_manaus = datetime.now(MANAUS)
                     if agora_manaus.weekday() < 6 and 7 <= agora_manaus.hour < 21:
                         data_hoje = agora_manaus.strftime("%d/%m/%Y")
