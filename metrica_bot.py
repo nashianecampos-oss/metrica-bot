@@ -709,10 +709,11 @@ def processar_mensagem(msg, sheets):
             return
         entrada_extra = registros[user_id]["entrada_extra"]
         extra_min = int((agora - entrada_extra).total_seconds() / 60)
-        data = registros[user_id].get("data", agora.strftime("%d/%m/%Y"))
+        data = agora.strftime("%d/%m/%Y")  # usa sempre a data atual
         try:
             salvar_extra(sheets, data, user_id,
                         entrada_extra.strftime("%H:%M"), agora.strftime("%H:%M"), extra_min)
+            print(f"Extra salvo: {nome} {data} {entrada_extra.strftime('%H:%M')} -> {agora.strftime('%H:%M')} ({extra_min}min)")
         except Exception as e:
             print(f"Erro sheets extra: {e}")
         del registros[user_id]["entrada_extra"]
