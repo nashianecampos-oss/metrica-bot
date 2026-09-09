@@ -254,6 +254,9 @@ def verificar_clickup_encerramento(telegram_id):
     clickup_id = config["clickup_id"]
     mention = config["mention"]
     agora = datetime.now(MANAUS)
+    # inicio_dia em UTC (ClickUp usa UTC em milliseconds)
+    inicio_dia_manaus = agora.replace(hour=0, minute=0, second=0, microsecond=0)
+    inicio_dia_utc = int(inicio_dia_manaus.astimezone(timezone.utc).timestamp() * 1000)
     inicio_dia = int(agora.replace(hour=0, minute=0, second=0).timestamp() * 1000)
     data = clickup_get(f"team/{WORKSPACE_CLICKUP}/time_entries?assignee={clickup_id}&start_date={inicio_dia}&end_date={int(agora.timestamp()*1000)}")
     entries = data.get("data", [])
@@ -271,13 +274,17 @@ def verificar_clickup_encerramento(telegram_id):
         feito_hoje = False
         falta_hoje = False
         for field in custom_fields:
-            nome = field.get("name", "").lower()
+            nome_field = field.get("name", "").lower()
             updated = field.get("date_updated")
-            atualizado_hoje = updated and int(updated) >= inicio_dia
-            if "foi feito" in nome or "feito" in nome:
-                feito_hoje = atualizado_hoje
-            elif "falta" in nome:
-                falta_hoje = atualizado_hoje
+            # Verifica se foi atualizado hoje em UTC (ClickUp usa UTC)
+            atualizado_hoje = updated and int(updated) >= inicio_dia_utc
+            # Também aceita se tem valor preenchido (independente de quando foi atualizado)
+            valor = field.get("value")
+            tem_valor = bool(valor and str(valor).strip())
+            if "foi feito" in nome_field or (nome_field == "o que foi feito?" ):
+                feito_hoje = atualizado_hoje or tem_valor
+            elif "falta" in nome_field:
+                falta_hoje = atualizado_hoje or tem_valor
         if not feito_hoje or not falta_hoje:
             tarefas_sem.append(task_name)
     if tarefas_sem:
@@ -345,7 +352,7 @@ def loop_verificar_clickup_sem_inicio(sheets):
         time.sleep(1800)
         try:
             agora = datetime.now(MANAUS)
-            if agora.weekday() == 6 or agora.hour < 7 or agora.hour >= 21:
+            if agora.weekday() == 6 or agora.hour < 6 or agora.hour >= 21:
                 if agora.hour == 0:
                     avisos_enviados.clear()
                     encerrou_hoje.clear()
@@ -467,7 +474,7 @@ def loop_drive(drive, sheets):
                     if ja_iniciou_hoje(telegram_id, sheets):
                         continue  # já iniciou hoje, não avisa
                     agora_manaus = datetime.now(MANAUS)
-                    if agora_manaus.weekday() < 6 and 7 <= agora_manaus.hour < 21:
+                    if agora_manaus.weekday() < 6 and 6 <= agora_manaus.hour < 21:
                         data_hoje = agora_manaus.strftime("%d/%m/%Y")
                         chave = f"aviso_drive_{telegram_id}_{data_hoje}"
                         if chave not in arquivos_vistos:
@@ -614,7 +621,7 @@ def processar_mensagem(msg, sheets):
         return
 
     agora = datetime.now(MANAUS)
-    if agora.weekday() == 6 or agora.hour < 7 or agora.hour >= 21:
+    if agora.weekday() == 6 or agora.hour < 6 or agora.hour >= 21:
         return
 
     nome = EQUIPE[user_id]["nome"]
