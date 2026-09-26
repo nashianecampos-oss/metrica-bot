@@ -93,6 +93,7 @@ COLUNAS_POR_PESSOA = 6
 registros = {}
 drive_atividades = {}
 drive_monitorando = {}
+modo_cliente = set()  # {telegram_id} — pessoa em pasta de cliente, ignora inatividade no Drive
 encerrou_hoje = set()  # {telegram_id} — quem já trabalhou e encerrou hoje
 arquivos_vistos = set()
 
@@ -454,6 +455,8 @@ def loop_drive(drive, sheets):
 
                 telegram_id = DRIVE_PARA_TELEGRAM.get(modificado_por)
                 if telegram_id and telegram_id in drive_monitorando:
+                    # Remove do modo cliente se estava lá
+                    modo_cliente.discard(telegram_id)
                     atividades = drive_atividades.get(telegram_id, {})
                     info = {"arquivo": f"{caminho} / {nome_arquivo}", "hora": hora}
                     if not atividades.get("primeira"):
@@ -466,6 +469,10 @@ def loop_drive(drive, sheets):
                     drive_atividades[telegram_id] = atividades
                 elif telegram_id and telegram_id not in drive_monitorando:
                     if telegram_id in encerrou_hoje:
+                        continue
+                    if telegram_id in modo_cliente:
+                        # Voltou ao Drive interno — remove modo cliente
+                        modo_cliente.discard(telegram_id)
                         continue
                     # Verifica na planilha se já encerrou ou iniciou hoje (sobrevive a reinícios)
                     if ja_encerrou_hoje(telegram_id, sheets):
@@ -666,7 +673,7 @@ def processar_mensagem(msg, sheets):
         # Verifica Drive após 45min
         def checar_drive_inicio():
             time.sleep(2700)
-            if user_id in drive_monitorando:
+            if user_id in drive_monitorando and user_id not in modo_cliente:
                 atividades = drive_atividades.get(user_id, {})
                 if not atividades.get("primeira"):
                     enviar_telegram(GRUPO_EQUIPE, None,
@@ -702,7 +709,11 @@ def processar_mensagem(msg, sheets):
             verificar_clickup_encerramento(user_id)
         threading.Thread(target=checar_clickup_enc, daemon=True).start()
 
-    elif texto_lower == "/iniciar extra":
+    elif texto_lower == "/cliente":
+        modo_cliente.add(user_id)
+        enviar_telegram(GRUPO_EQUIPE, None,
+                       f"👤 *{nome}* em pasta de cliente — monitoramento Drive pausado.\n"
+                       f"Volta ao normal automaticamente quando salvar arquivo nas pastas internas.")
         if user_id not in registros:
             registros[user_id] = {}
         registros[user_id]["entrada_extra"] = agora
