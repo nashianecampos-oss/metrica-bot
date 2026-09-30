@@ -147,6 +147,36 @@ def ja_iniciou_hoje(user_id, sheets):
     except:
         return False
 
+def recuperar_entrada_extra_hoje(user_id, sheets):
+    """Se a extra foi iniciada mas o bot reiniciou (perdeu o estado em memória),
+    recupera o horário de início a partir da planilha (coluna Extra Entrada)."""
+    try:
+        agora = datetime.now(MANAUS)
+        data_hoje = agora.strftime("%d/%m/%Y")
+        nome_aba = agora.strftime("%m-%Y")
+        resultado = sheets.spreadsheets().values().get(
+            spreadsheetId=PLANILHA_ID,
+            range=f"'{nome_aba}'!A:A"
+        ).execute()
+        datas = [r[0] if r else "" for r in resultado.get("values", [])]
+        if data_hoje not in datas:
+            return None
+        linha_idx = datas.index(data_hoje)
+        pos = ORDEM_PLANILHA.index(user_id)
+        col_extra_entrada = 1 + pos * COLUNAS_POR_PESSOA + 3  # coluna Extra Entrada
+        resultado2 = sheets.spreadsheets().values().get(
+            spreadsheetId=PLANILHA_ID,
+            range=f"'{nome_aba}'!{col_letra(col_extra_entrada)}{linha_idx + 1}"
+        ).execute()
+        valores = resultado2.get("values", [])
+        if not (valores and valores[0]):
+            return None
+        hora_str = valores[0][0]
+        hora, minuto = map(int, hora_str.split(":"))
+        return agora.replace(hour=hora, minute=minuto, second=0, microsecond=0)
+    except:
+        return None
+
 # ─── CREDENCIAIS ─────────────────────────────────────────────
 def carregar_credenciais():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
@@ -714,6 +744,13 @@ def processar_mensagem(msg, sheets):
         enviar_telegram(GRUPO_EQUIPE, None,
                        f"👤 *{nome}* em pasta de cliente — monitoramento Drive pausado.\n"
                        f"Volta ao normal automaticamente quando salvar arquivo nas pastas internas.")
+
+        if user_id in registros and "entrada_extra" in registros[user_id]:
+            hora_extra = registros[user_id]["entrada_extra"].strftime("%H:%M")
+            enviar_telegram(GRUPO_EQUIPE, None,
+                           f"⚠️ {mention}, sua hora extra já estava iniciada às {hora_extra}.")
+            return
+
         if user_id not in registros:
             registros[user_id] = {}
         registros[user_id]["entrada_extra"] = agora
@@ -721,11 +758,30 @@ def processar_mensagem(msg, sheets):
             registros[user_id]["data"] = agora.strftime("%d/%m/%Y")
         enviar_telegram(GRUPO_EQUIPE, None, f"⭐ *{nome}* iniciou hora extra às {agora.strftime('%H:%M')}")
 
+        # Salva entrada extra na planilha imediatamente (sobrevive a restart do Railway)
+        try:
+            nome_aba = agora.strftime("%m-%Y")
+            garantir_aba(sheets, nome_aba)
+            linha = get_ou_criar_linha(sheets, nome_aba, agora.strftime("%d/%m/%Y"))
+            pos = ORDEM_PLANILHA.index(user_id)
+            col_extra_entrada = 1 + pos * COLUNAS_POR_PESSOA + 3
+            atualizar_celulas(sheets, nome_aba, linha, col_extra_entrada, [agora.strftime("%H:%M")])
+        except Exception as e:
+            print(f"Erro ao salvar entrada extra: {e}")
+
     elif texto_lower == "/encerrando extra":
-        if user_id not in registros or "entrada_extra" not in registros[user_id]:
-            enviar_telegram(GRUPO_EQUIPE, None, f"⚠️ {mention}, use /iniciar extra primeiro.")
+        entrada_extra = None
+        if user_id in registros and "entrada_extra" in registros[user_id]:
+            entrada_extra = registros[user_id]["entrada_extra"]
+        else:
+            entrada_extra = recuperar_entrada_extra_hoje(user_id, sheets)
+
+        if entrada_extra is None:
+            enviar_telegram(GRUPO_EQUIPE, None, f"⚠️ {mention}, use /cliente primeiro para iniciar a extra.")
             return
-        entrada_extra = registros[user_id]["entrada_extra"]
+
+        if user_id not in registros:
+            registros[user_id] = {}
         extra_min = int((agora - entrada_extra).total_seconds() / 60)
         data = agora.strftime("%d/%m/%Y")  # usa sempre a data atual
         try:
@@ -734,7 +790,7 @@ def processar_mensagem(msg, sheets):
             print(f"Extra salvo: {nome} {data} {entrada_extra.strftime('%H:%M')} -> {agora.strftime('%H:%M')} ({extra_min}min)")
         except Exception as e:
             print(f"Erro sheets extra: {e}")
-        del registros[user_id]["entrada_extra"]
+        registros[user_id].pop("entrada_extra", None)
         extra_h = extra_min // 60
         extra_m = extra_min % 60
         enviar_telegram(GRUPO_EQUIPE, None,
