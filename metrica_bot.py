@@ -797,6 +797,51 @@ def processar_mensagem(msg, sheets):
                        f"⭐ *{nome}* encerrou hora extra\n⏱ Extra: *{extra_h}h{extra_m:02d}min*")
 
 # ─── RELATÓRIO MENSAL ─────────────────────────────────────────
+def gerar_relatorio_horas_extras(sheets):
+    import calendar
+    agora = datetime.now(MANAUS)
+    mes_anterior = agora.replace(day=1) - timedelta(days=1)
+    nome_aba = mes_anterior.strftime("%m-%Y")
+    mes_str = mes_anterior.strftime("%m/%Y")
+
+    try:
+        resultado = sheets.spreadsheets().values().get(
+            spreadsheetId=PLANILHA_ID, range=f"'{nome_aba}'!A1:Z1000"
+        ).execute()
+        linhas = resultado.get("values", [])
+    except:
+        enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS, f"⚠️ Sem dados de extras para {mes_str}")
+        return
+
+    if len(linhas) <= 1:
+        enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS, f"⚠️ Sem registros de extras em {mes_str}")
+        return
+
+    relatorio = [f"⭐ *Horas extras — {mes_str}*\n"]
+
+    for i, uid in enumerate(ORDEM_PLANILHA):
+        if uid == 2048504320:  # Nagia não entra
+            continue
+        nome = EQUIPE[uid]["nome"]
+        col_extra = 1 + i * COLUNAS_POR_PESSOA + 5  # coluna Extra Total (0-based)
+
+        total_min = 0
+        for linha in linhas[1:]:
+            if len(linha) > col_extra and linha[col_extra]:
+                valor = linha[col_extra]
+                try:
+                    h = int(valor.split("h")[0])
+                    m = int(valor.split("h")[1].replace("min", ""))
+                    total_min += h * 60 + m
+                except:
+                    pass
+
+        horas = total_min // 60
+        mins = total_min % 60
+        relatorio.append(f"👤 *{nome}*: {horas}h{mins:02d}min")
+
+    enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS, "\n".join(relatorio))
+
 def gerar_relatorio_mensal(sheets):
     agora = datetime.now(MANAUS)
     mes_anterior = agora.replace(day=1) - timedelta(days=1)
@@ -850,6 +895,7 @@ def main():
             if agora.day == 1 and agora.hour == 8 and agora.minute == 0:
                 if not relatorio_enviado:
                     gerar_relatorio_mensal(sheets)
+                    gerar_relatorio_horas_extras(sheets)
                     relatorio_enviado = True
             else:
                 relatorio_enviado = False
