@@ -248,12 +248,16 @@ def notificar_tarefa_criada(task_data):
         return
 
     pasta_id = get_pasta_id_da_tarefa(task_id)
+    print(f"Pasta ID: {pasta_id} | Tarefa: {task_name}")
     if not pasta_id:
+        print(f"Pasta não encontrada para tarefa: {task_name}")
         return
 
     # Busca vínculo
     destino = PASTA_PARA_TOPICO.get(pasta_id) or vinculos_dinamicos.get(pasta_id)
+    print(f"Destino: {destino}")
     if not destino:
+        print(f"Pasta {pasta_id} não mapeada")
         return
 
     mensagem = (
