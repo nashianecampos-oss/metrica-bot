@@ -30,7 +30,7 @@ BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 PASTA_PARA_TOPICO = {
     "90114672064": {"chat_id": GRUPO_EQUIPE, "thread_id": 347,  "nome": "Mall Reserva Inglesa"},
     "90116580759": {"chat_id": GRUPO_EQUIPE, "thread_id": 354,  "nome": "Horizonte Rio Negro"},
-    "90117070701": {"chat_id": GRUPO_EQUIPE, "thread_id": 350,  "nome": "Ideal+ Liberdade 3"},
+    "90117070701": {"chat_id": GRUPO_EQUIPE, "thread_id": 355,  "nome": "Ideal+ Liberdade 3"},
     "90117196036": {"chat_id": GRUPO_EQUIPE, "thread_id": 356,  "nome": "Elevare+ Vitória"},
     "90117287971": {"chat_id": GRUPO_EQUIPE, "thread_id": 352,  "nome": "Ideal+ Cachoeiras"},
     "90117542148": {"chat_id": GRUPO_EQUIPE, "thread_id": 358,  "nome": "Ideal+ Liberdade 4"},
@@ -205,7 +205,9 @@ def enviar_telegram(chat_id, thread_id, texto):
     if thread_id:
         payload["message_thread_id"] = thread_id
     try:
-        requests.post(f"{BASE_URL}/sendMessage", json=payload)
+        r = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=20)
+        if r.status_code != 200:
+            print(f"Telegram recusou ({r.status_code}) chat={chat_id} thread={thread_id}: {r.text[:200]}")
     except Exception as e:
         print(f"Erro telegram: {e}")
 
