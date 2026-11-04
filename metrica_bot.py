@@ -25,6 +25,22 @@ PORT = int(os.environ.get("PORT", 8080))
 
 MANAUS = timezone(timedelta(hours=-4))
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+SESSION_TG = requests.Session()  # reutiliza a conexão e reduz tráfego de rede
+
+# Janela de silêncio (horário de Manaus): sem avisos/cobranças automáticas entre 11h e 14h (almoço)
+JANELA_SILENCIO = (11, 14)
+
+def em_janela_silencio(agora=None):
+    agora = agora or datetime.now(MANAUS)
+    return JANELA_SILENCIO[0] <= agora.hour < JANELA_SILENCIO[1]
+
+def aguardar_fim_silencio():
+    """Se estiver na janela de silêncio, espera até o fim dela (usado em verificações atrasadas)."""
+    agora = datetime.now(MANAUS)
+    if not em_janela_silencio(agora):
+        return
+    fim = agora.replace(hour=JANELA_SILENCIO[1], minute=0, second=30, microsecond=0)
+    time.sleep(max(0, (fim - agora).total_seconds()))
 
 # Mapeamento pasta ClickUp → {grupo, tópico}
 PASTA_PARA_TOPICO = {
@@ -96,6 +112,17 @@ registros = {}
 drive_atividades = {}
 drive_monitorando = {}
 modo_cliente = set()  # {telegram_id} — pessoa em pasta de cliente, ignora inatividade no Drive
+drive_ultimo_ts = {}     # {telegram_id: datetime} última atividade no Drive (ou início do expediente)
+drive_ultimo_aviso = {}  # {telegram_id: datetime} último aviso de inatividade enviado
+INTERVALO_INATIVIDADE_MIN = 45  # primeiro aviso: 45 min sem atividade no Drive
+INTERVALO_REPETICAO_MIN = 5     # depois do primeiro aviso, repete de 5 em 5 min até a pessoa salvar
+drive_avisos_encerrados = set()  # {telegram_id} — encerrou expediente ou extra: sem avisos de Drive/ClickUp até /iniciar ou meia-noite
+
+def sem_avisos_de_atividade(telegram_id):
+    """True se a pessoa encerrou expediente/extra ou está em hora extra: nenhum aviso de atividade deve ser enviado."""
+    if telegram_id in drive_avisos_encerrados:
+        return True
+    return bool(registros.get(telegram_id, {}).get("entrada_extra"))  # hora extra em andamento
 encerrou_hoje = set()  # {telegram_id} — quem já trabalhou e encerrou hoje
 arquivos_vistos = set()
 
@@ -396,6 +423,8 @@ def loop_verificar_clickup_sem_inicio(sheets):
                     avisos_enviados.clear()
                     encerrou_hoje.clear()
                 continue
+            if em_janela_silencio(agora):
+                continue  # almoço: sem avisos
 
             inicio_dia = int(agora.replace(hour=0, minute=0, second=0).timestamp() * 1000)
             data_hoje = agora.strftime("%d/%m/%Y")
@@ -405,7 +434,7 @@ def loop_verificar_clickup_sem_inicio(sheets):
                     continue
                 if telegram_id in drive_monitorando:
                     continue
-                if telegram_id in encerrou_hoje:
+                if telegram_id in encerrou_hoje or sem_avisos_de_atividade(telegram_id):
                     continue
                 # Verifica na planilha se já encerrou ou iniciou hoje (sobrevive a reinícios)
                 if ja_encerrou_hoje(telegram_id, sheets):
@@ -468,6 +497,54 @@ def buscar_arquivos_drive(drive, desde):
     ).execute()
     return resultado.get("files", [])
 
+def loop_aviso_inatividade_drive():
+    """A cada minuto, avisa quem está em expediente e passou 45 min sem salvar arquivo no Drive.
+    Depois do primeiro aviso, repete de 5 em 5 min até a pessoa salvar um arquivo (ou usar /cliente
+    ou /encerrando). Só compara horários na memória."""
+    while True:
+        time.sleep(60)
+        try:
+            agora = datetime.now(MANAUS)
+            if agora.hour == 0:
+                drive_avisos_encerrados.clear()  # novo dia
+            if agora.weekday() == 6 or agora.hour < 6 or agora.hour >= 21:
+                continue
+            if em_janela_silencio(agora):
+                # almoço: congela a contagem; ela recomeça do zero ao fim da janela
+                for tid in list(drive_monitorando.keys()):
+                    drive_ultimo_ts[tid] = agora
+                    drive_ultimo_aviso.pop(tid, None)
+                continue
+            for telegram_id in list(drive_monitorando.keys()):
+                config = EQUIPE.get(telegram_id)
+                if not config or not config.get("drive_name"):
+                    continue  # sem conta do Drive mapeada (ex.: Nagia): não dá para monitorar
+                if telegram_id in modo_cliente:
+                    continue  # em pasta de cliente (comando /cliente)
+                if sem_avisos_de_atividade(telegram_id):
+                    continue  # encerrou expediente/extra ou está em hora extra
+                ultimo = drive_ultimo_ts.get(telegram_id)
+                if not ultimo:
+                    continue
+                ultimo_aviso = drive_ultimo_aviso.get(telegram_id)
+                sem_atividade = int((agora - ultimo).total_seconds() // 60)
+                if ultimo_aviso is None:
+                    # ainda não avisou: espera 45 min sem atividade
+                    devido = (agora - ultimo).total_seconds() >= INTERVALO_INATIVIDADE_MIN * 60
+                    texto = (f"⚠️ {config['mention']}, faz {sem_atividade} minutos que não há atividade no Drive. "
+                             f"Salve o arquivo em que está trabalhando. "
+                             f"Se estiver em pasta de cliente, use /cliente.")
+                else:
+                    # já avisou: repete a cada 5 min (tolerância de 10 s por causa do ciclo de 1 min)
+                    devido = (agora - ultimo_aviso).total_seconds() >= INTERVALO_REPETICAO_MIN * 60 - 10
+                    texto = (f"⚠️ {config['mention']}, ainda sem atividade no Drive (faz {sem_atividade} minutos). "
+                             f"Salve o arquivo em que está trabalhando ou use /cliente.")
+                if devido:
+                    drive_ultimo_aviso[telegram_id] = agora
+                    enviar_telegram(GRUPO_EQUIPE, None, texto)
+        except Exception as e:
+            print(f"Erro aviso inatividade drive: {e}")
+
 def loop_drive(drive, sheets):
     global arquivos_vistos
     ultimo_check = datetime.now(MANAUS)  # ignora histórico anterior ao deploy
@@ -483,9 +560,10 @@ def loop_drive(drive, sheets):
                 arquivos_vistos.add(file_id)
                 nome_arquivo = arquivo["name"]
                 modificado_por = arquivo.get("lastModifyingUser", {}).get("displayName", "")
-                hora = datetime.fromisoformat(
+                momento = datetime.fromisoformat(
                     arquivo["modifiedTime"].replace("Z", "+00:00")
-                ).astimezone(MANAUS).strftime("%H:%M")
+                ).astimezone(MANAUS)
+                hora = momento.strftime("%H:%M")
                 caminho = get_caminho_drive(drive, arquivo.get("parents", []))
 
                 enviar_telegram(GRUPO_PRIVADO, None,
@@ -495,6 +573,9 @@ def loop_drive(drive, sheets):
                 if telegram_id and telegram_id in drive_monitorando:
                     # Remove do modo cliente se estava lá
                     modo_cliente.discard(telegram_id)
+                    # Zera o contador de inatividade
+                    drive_ultimo_ts[telegram_id] = max(momento, drive_ultimo_ts.get(telegram_id, momento))
+                    drive_ultimo_aviso.pop(telegram_id, None)
                     atividades = drive_atividades.get(telegram_id, {})
                     info = {"arquivo": f"{caminho} / {nome_arquivo}", "hora": hora}
                     if not atividades.get("primeira"):
@@ -506,7 +587,7 @@ def loop_drive(drive, sheets):
                     atividades["ultima"] = info
                     drive_atividades[telegram_id] = atividades
                 elif telegram_id and telegram_id not in drive_monitorando:
-                    if telegram_id in encerrou_hoje:
+                    if telegram_id in encerrou_hoje or sem_avisos_de_atividade(telegram_id):
                         continue
                     if telegram_id in modo_cliente:
                         # Voltou ao Drive interno — remove modo cliente
@@ -519,7 +600,7 @@ def loop_drive(drive, sheets):
                     if ja_iniciou_hoje(telegram_id, sheets):
                         continue  # já iniciou hoje, não avisa
                     agora_manaus = datetime.now(MANAUS)
-                    if agora_manaus.weekday() < 6 and 6 <= agora_manaus.hour < 21:
+                    if agora_manaus.weekday() < 6 and 6 <= agora_manaus.hour < 21 and not em_janela_silencio(agora_manaus):
                         data_hoje = agora_manaus.strftime("%d/%m/%Y")
                         chave = f"aviso_drive_{telegram_id}_{data_hoje}"
                         if chave not in arquivos_vistos:
@@ -688,6 +769,9 @@ def processar_mensagem(msg, sheets):
         registros[user_id]["data"] = agora.strftime("%d/%m/%Y")
         drive_monitorando[user_id] = True
         drive_atividades[user_id] = {"primeira": None, "ultima": None}
+        drive_ultimo_ts[user_id] = agora
+        drive_ultimo_aviso.pop(user_id, None)
+        drive_avisos_encerrados.discard(user_id)
         enviar_telegram(GRUPO_EQUIPE, None, f"✅ *{nome}* iniciou às {agora.strftime('%H:%M')}")
 
         # Salva entrada na planilha imediatamente
@@ -704,20 +788,12 @@ def processar_mensagem(msg, sheets):
         # Verifica ClickUp após 5min
         def checar_clickup_inicio():
             time.sleep(900)  # 15 minutos
+            aguardar_fim_silencio()
             if user_id in drive_monitorando:
                 verificar_clickup_inicio(user_id)
         threading.Thread(target=checar_clickup_inicio, daemon=True).start()
 
-        # Verifica Drive após 45min
-        def checar_drive_inicio():
-            time.sleep(2700)
-            if user_id in drive_monitorando and user_id not in modo_cliente:
-                atividades = drive_atividades.get(user_id, {})
-                if not atividades.get("primeira"):
-                    enviar_telegram(GRUPO_EQUIPE, None,
-                                   f"⚠️ {mention}, você iniciou há 45 minutos mas ainda não há "
-                                   f"nenhuma atividade registrada no Drive!")
-        threading.Thread(target=checar_drive_inicio, daemon=True).start()
+        # Aviso de inatividade no Drive (a cada 45 min): feito por loop_aviso_inatividade_drive
 
     elif texto_lower == "/encerrando":
         if user_id not in registros or "entrada" not in registros[user_id]:
@@ -730,6 +806,9 @@ def processar_mensagem(msg, sheets):
         horas = minutos_liquidos // 60
         mins = minutos_liquidos % 60
         drive_monitorando.pop(user_id, None)
+        drive_ultimo_ts.pop(user_id, None)
+        drive_ultimo_aviso.pop(user_id, None)
+        drive_avisos_encerrados.add(user_id)
         encerrou_hoje.add(user_id)
         ultima_drive = drive_atividades.get(user_id, {}).get("ultima")
         msg_drive = f"\n📁 Última atividade Drive: {ultima_drive['hora']}\n_{ultima_drive['arquivo']}_" if ultima_drive else ""
@@ -744,6 +823,7 @@ def processar_mensagem(msg, sheets):
                        f"⏱ Trabalhado: *{horas}h{mins:02d}min*{msg_drive}")
         def checar_clickup_enc():
             time.sleep(300)
+            aguardar_fim_silencio()
             verificar_clickup_encerramento(user_id)
         threading.Thread(target=checar_clickup_enc, daemon=True).start()
 
@@ -799,6 +879,8 @@ def processar_mensagem(msg, sheets):
         except Exception as e:
             print(f"Erro sheets extra: {e}")
         registros[user_id].pop("entrada_extra", None)
+        drive_avisos_encerrados.add(user_id)
+        drive_ultimo_aviso.pop(user_id, None)
         extra_h = extra_min // 60
         extra_m = extra_min % 60
         enviar_telegram(GRUPO_EQUIPE, None,
@@ -882,6 +964,7 @@ def main():
     threading.Thread(target=loop_drive, args=(drive, sheets), daemon=True).start()
     threading.Thread(target=loop_webhook, daemon=True).start()
     threading.Thread(target=loop_verificar_clickup_sem_inicio, args=(sheets,), daemon=True).start()
+    threading.Thread(target=loop_aviso_inatividade_drive, daemon=True).start()
 
     offset = None
     relatorio_enviado = False
@@ -891,7 +974,12 @@ def main():
             params = {"timeout": 10}
             if offset:
                 params["offset"] = offset
-            r = requests.get(f"{BASE_URL}/getUpdates", params=params, timeout=15)
+            r = SESSION_TG.get(f"{BASE_URL}/getUpdates", params=params, timeout=15)
+            if r.status_code != 200:
+                # Token inválido (401), conflito (409) etc.: não pode repetir sem pausa
+                print(f"Telegram getUpdates falhou ({r.status_code}): {r.text[:150]}")
+                time.sleep(30)
+                continue
             updates = r.json().get("result", [])
             for update in updates:
                 offset = update["update_id"] + 1
