@@ -4,6 +4,8 @@ import time
 import requests
 import io
 import threading
+import re
+import unicodedata
 from datetime import datetime, timezone, timedelta
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
@@ -257,6 +259,222 @@ def clickup_get(endpoint):
     )
     return r.json()
 
+ABA_VINCULOS = "vinculos"  # aba da planilha onde ficam os vínculos pasta → tópico (sobrevivem a reinícios)
+
+def _garantir_aba_vinculos(sheets):
+    meta = sheets.spreadsheets().get(spreadsheetId=PLANILHA_ID).execute()
+    abas = [sh["properties"]["title"] for sh in meta["sheets"]]
+    if ABA_VINCULOS not in abas:
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=PLANILHA_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": ABA_VINCULOS}}}]}
+        ).execute()
+        sheets.spreadsheets().values().update(
+            spreadsheetId=PLANILHA_ID, range=f"'{ABA_VINCULOS}'!A1",
+            valueInputOption="RAW", body={"values": [["pasta_id", "chat_id", "thread_id", "nome"]]}
+        ).execute()
+
+def carregar_vinculos(sheets):
+    """Recarrega da planilha os vínculos pasta → tópico criados pelo bot."""
+    _garantir_aba_vinculos(sheets)
+    r = sheets.spreadsheets().values().get(
+        spreadsheetId=PLANILHA_ID, range=f"'{ABA_VINCULOS}'!A2:D1000"
+    ).execute()
+    n = 0
+    for linha in r.get("values", []):
+        if len(linha) >= 3 and linha[0] and linha[2]:
+            try:
+                vinculos_dinamicos[str(linha[0]).strip()] = {
+                    "chat_id": str(linha[1]).strip(),
+                    "thread_id": int(linha[2]),
+                    "nome": linha[3] if len(linha) > 3 else "",
+                }
+                n += 1
+            except ValueError:
+                pass
+    print(f"🔗 {n} vínculo(s) pasta→tópico carregado(s) da planilha")
+
+def salvar_vinculo(sheets, pasta_id, destino):
+    """Guarda o vínculo na planilha (atualiza a linha se a pasta já existir)."""
+    vinculos_dinamicos[pasta_id] = destino
+    _garantir_aba_vinculos(sheets)
+    r = sheets.spreadsheets().values().get(
+        spreadsheetId=PLANILHA_ID, range=f"'{ABA_VINCULOS}'!A:A"
+    ).execute()
+    ids = [(l[0] if l else "") for l in r.get("values", [])]
+    linha = [pasta_id, str(destino["chat_id"]), destino["thread_id"], destino["nome"]]
+    if pasta_id in ids:
+        n = ids.index(pasta_id) + 1
+        sheets.spreadsheets().values().update(
+            spreadsheetId=PLANILHA_ID, range=f"'{ABA_VINCULOS}'!A{n}:D{n}",
+            valueInputOption="RAW", body={"values": [linha]}
+        ).execute()
+    else:
+        sheets.spreadsheets().values().append(
+            spreadsheetId=PLANILHA_ID, range=f"'{ABA_VINCULOS}'!A1",
+            valueInputOption="RAW", insertDataOption="INSERT_ROWS", body={"values": [linha]}
+        ).execute()
+
+def registrar_vinculo(sheets, pasta_id, thread_id, nome):
+    """Confere a pasta no ClickUp, guarda o vínculo e devolve (ok, mensagem para a Nagia)."""
+    nome_pasta = "?"
+    try:
+        pasta = clickup_get(f"folder/{pasta_id}")
+        if str(pasta.get("id")) != pasta_id:
+            return False, (f"⚠️ Não encontrei a pasta `{pasta_id}` no ClickUp. Confira o ID: "
+                           f"é o número depois de /f/ na URL da pasta.")
+        nome_pasta = str(pasta.get("name", "?"))
+        for ch in "_*`[":
+            nome_pasta = nome_pasta.replace(ch, " ")
+    except Exception as e:
+        print(f"Erro ao conferir pasta {pasta_id}: {e}")
+    destino = {"chat_id": GRUPO_EQUIPE, "thread_id": int(thread_id), "nome": nome}
+    try:
+        salvar_vinculo(sheets, pasta_id, destino)
+        aviso = ""
+    except Exception as e:
+        print(f"Erro ao salvar vínculo na planilha: {e}")
+        vinculos_dinamicos[pasta_id] = destino
+        aviso = "\n⚠️ Não consegui salvar na planilha: se o bot reiniciar, este vínculo se perde."
+    return True, f"✅ Tópico *{nome}* vinculado à pasta `{pasta_id}` ({nome_pasta}).{aviso}"
+
+# ─── APRENDIZADO AUTOMÁTICO DE TÓPICOS E VÍNCULO POR NOME ──────
+ABA_TOPICOS = "topicos"      # aba da planilha: tópicos do grupo da equipe que o bot já viu (thread_id, nome)
+topicos_conhecidos = {}      # {thread_id: nome}
+sheets_global = None         # preenchido no main(); usado pelo webhook
+pastas_avisadas = set()      # pastas sem tópico que já geraram aviso nesta execução
+
+def _limpar_md(texto):
+    for ch in "_*`[":
+        texto = str(texto).replace(ch, " ")
+    return texto
+
+def _garantir_aba_generica(sheets, titulo, cabecalho):
+    meta = sheets.spreadsheets().get(spreadsheetId=PLANILHA_ID).execute()
+    if titulo not in [sh["properties"]["title"] for sh in meta["sheets"]]:
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=PLANILHA_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": titulo}}}]}
+        ).execute()
+        sheets.spreadsheets().values().update(
+            spreadsheetId=PLANILHA_ID, range=f"'{titulo}'!A1",
+            valueInputOption="RAW", body={"values": [cabecalho]}
+        ).execute()
+
+def carregar_topicos(sheets):
+    """Recarrega da planilha os tópicos que o bot já aprendeu."""
+    _garantir_aba_generica(sheets, ABA_TOPICOS, ["thread_id", "nome"])
+    r = sheets.spreadsheets().values().get(
+        spreadsheetId=PLANILHA_ID, range=f"'{ABA_TOPICOS}'!A2:D1000"
+    ).execute()
+    for linha in r.get("values", []):
+        if len(linha) >= 2 and linha[0]:
+            try:
+                topicos_conhecidos[int(linha[0])] = linha[1]
+            except ValueError:
+                pass
+    print(f"🧭 {len(topicos_conhecidos)} tópico(s) conhecido(s) carregado(s) da planilha")
+
+def _salvar_topico(sheets, thread_id, nome):
+    _garantir_aba_generica(sheets, ABA_TOPICOS, ["thread_id", "nome"])
+    r = sheets.spreadsheets().values().get(
+        spreadsheetId=PLANILHA_ID, range=f"'{ABA_TOPICOS}'!A:A"
+    ).execute()
+    ids = [(l[0] if l else "") for l in r.get("values", [])]
+    linha = [str(thread_id), nome]
+    if str(thread_id) in ids:
+        n = ids.index(str(thread_id)) + 1
+        sheets.spreadsheets().values().update(
+            spreadsheetId=PLANILHA_ID, range=f"'{ABA_TOPICOS}'!A{n}:B{n}",
+            valueInputOption="RAW", body={"values": [linha]}
+        ).execute()
+    else:
+        sheets.spreadsheets().values().append(
+            spreadsheetId=PLANILHA_ID, range=f"'{ABA_TOPICOS}'!A1",
+            valueInputOption="RAW", insertDataOption="INSERT_ROWS", body={"values": [linha]}
+        ).execute()
+
+def aprender_topico(sheets, msg):
+    """Aprende o nome dos tópicos só lendo as conversas do grupo da equipe (nada manual)."""
+    thread_id = msg.get("message_thread_id")
+    if not thread_id or thread_id == 1:
+        return
+    nome = ((msg.get("forum_topic_edited") or {}).get("name")
+            or (msg.get("forum_topic_created") or {}).get("name"))
+    if not nome:
+        # mensagem comum no tópico: só serve para descobrir tópicos ainda desconhecidos
+        if thread_id in topicos_conhecidos:
+            return
+        nome = ((msg.get("reply_to_message") or {}).get("forum_topic_created") or {}).get("name")
+    if not nome or topicos_conhecidos.get(thread_id) == nome:
+        return
+    topicos_conhecidos[thread_id] = nome
+    try:
+        _salvar_topico(sheets, thread_id, nome)
+    except Exception as e:
+        print(f"Erro ao salvar tópico {thread_id}: {e}")
+
+def _tokens_nome(nome, remover_sufixo=True):
+    """Palavras-chave do nome, sem acento/pontuação e sem o ' - NOME DA PESSOA' dos tópicos."""
+    n = unicodedata.normalize("NFKD", str(nome)).encode("ascii", "ignore").decode().upper()
+    if remover_sufixo:
+        n = re.sub(r"\s+-\s+.*$", "", n)
+    n = re.sub(r"[^A-Z0-9]+", " ", n)
+    return {((t.lstrip("0") or "0") if t.isdigit() else t) for t in n.split()}
+
+def tentar_vincular_por_nome(pasta_id, nome_pasta):
+    """Liga a pasta ao tópico de nome equivalente; só vincula se houver exatamente um candidato."""
+    usados = {d["thread_id"] for d in list(PASTA_PARA_TOPICO.values()) + list(vinculos_dinamicos.values())
+              if str(d["chat_id"]) == str(GRUPO_EQUIPE)}
+    alvo = _tokens_nome(nome_pasta, remover_sufixo=False)
+    exatos, parciais = [], []
+    for thread_id, nome in topicos_conhecidos.items():
+        if thread_id in usados:
+            continue
+        t = _tokens_nome(nome)
+        if len(t) < 2:
+            continue
+        if t == alvo:
+            exatos.append((thread_id, nome))
+        elif t <= alvo:
+            parciais.append((thread_id, nome))
+    candidatos = exatos if exatos else parciais
+    if len(candidatos) != 1:
+        return None
+    thread_id, nome = candidatos[0]
+    destino = {"chat_id": GRUPO_EQUIPE, "thread_id": thread_id, "nome": nome}
+    try:
+        salvar_vinculo(sheets_global, pasta_id, destino)
+    except Exception as e:
+        print(f"Erro ao salvar vínculo automático: {e}")
+        vinculos_dinamicos[pasta_id] = destino
+    enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
+                   f"🔗 Vinculei automaticamente a pasta *{_limpar_md(nome_pasta)}* ao tópico *{_limpar_md(nome)}*. "
+                   f"Se estiver errado, use /vincular ID_DA_PASTA dentro do tópico certo.")
+    return destino
+
+def avisar_pasta_sem_topico(pasta_id, nome_pasta, tarefa):
+    if pasta_id in pastas_avisadas:
+        return
+    pastas_avisadas.add(pasta_id)
+    enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
+                   f"⚠️ Criaram a tarefa *{_limpar_md(tarefa)}* na pasta *{_limpar_md(nome_pasta)}* (`{pasta_id}`), "
+                   f"mas não encontrei tópico para ela. Se o tópico existe, basta alguém escrever nele: o bot "
+                   f"aprende o nome e vincula sozinho na próxima tarefa. Ou use /vincular {pasta_id} dentro do tópico.")
+
+def get_pasta_da_tarefa(task_id):
+    """Retorna (id, nome) da pasta da tarefa, ou (None, None)."""
+    try:
+        task = clickup_get(f"task/{task_id}")
+        for chave in ("project", "folder"):
+            obj = task.get(chave, {}) or {}
+            if not obj.get("hidden", True) and obj.get("id"):
+                return str(obj.get("id")), str(obj.get("name", ""))
+        return None, None
+    except Exception as e:
+        print(f"Erro get_pasta: {e}")
+        return None, None
+
 def get_pasta_id_da_tarefa(task_id):
     """Retorna o folder_id da tarefa usando project.id"""
     try:
@@ -287,7 +505,7 @@ def notificar_tarefa_criada(task_data):
         print(f"Ignorando tarefa com status OBJETIVO: {task_name}")
         return
 
-    pasta_id = get_pasta_id_da_tarefa(task_id)
+    pasta_id, nome_pasta = get_pasta_da_tarefa(task_id)
     print(f"Pasta ID: {pasta_id} | Tarefa: {task_name}")
     if not pasta_id:
         print(f"Pasta não encontrada para tarefa: {task_name}")
@@ -295,9 +513,12 @@ def notificar_tarefa_criada(task_data):
 
     # Busca vínculo
     destino = PASTA_PARA_TOPICO.get(pasta_id) or vinculos_dinamicos.get(pasta_id)
+    if not destino:
+        destino = tentar_vincular_por_nome(pasta_id, nome_pasta)
     print(f"Destino: {destino}")
     if not destino:
         print(f"Pasta {pasta_id} não mapeada")
+        avisar_pasta_sem_topico(pasta_id, nome_pasta, task_name)
         return
 
     mensagem = (
@@ -722,6 +943,13 @@ def processar_mensagem(msg, sheets):
     chat_id = str(msg.get("chat", {}).get("id", ""))
     thread_id = msg.get("message_thread_id")
 
+    # Aprende os tópicos do grupo da equipe só lendo as mensagens
+    if chat_id == GRUPO_EQUIPE:
+        try:
+            aprender_topico(sheets, msg)
+        except Exception as e:
+            print(f"Erro ao aprender tópico: {e}")
+
     # Detecta novo tópico criado no grupo equipe
     if chat_id == GRUPO_EQUIPE and msg.get("forum_topic_created"):
         nome_topico = msg["forum_topic_created"]["name"]
@@ -740,16 +968,27 @@ def processar_mensagem(msg, sheets):
             del aguardando_vinculo[user_id]
             enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS, "Ok, tópico não vinculado.")
             return
-        elif texto.isdigit():
-            info = aguardando_vinculo.pop(user_id)
-            vinculos_dinamicos[texto] = {
-                "chat_id": GRUPO_EQUIPE,
-                "thread_id": info["thread_id"],
-                "nome": info["nome"]
-            }
-            enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
-                           f"✅ Tópico *{info['nome']}* vinculado à pasta `{texto}`!")
+        elif texto.strip().isdigit():
+            info = aguardando_vinculo[user_id]
+            ok, resposta = registrar_vinculo(sheets, texto.strip(), info["thread_id"], info["nome"])
+            if ok:
+                aguardando_vinculo.pop(user_id, None)
+            enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS, resposta)
             return
+
+    # /vincular <ID da pasta>: vincula o tópico em que o comando foi enviado (só a Nagia)
+    if (chat_id == GRUPO_EQUIPE and user_id == 2048504320 and texto.split()
+            and texto.split()[0].split("@")[0].lower() == "/vincular"):
+        partes = texto.split()
+        if thread_id is None or thread_id == 1 or len(partes) < 2 or not partes[1].isdigit():
+            enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
+                           "ℹ️ Use */vincular ID_DA_PASTA* dentro do tópico do projeto (não no Geral).")
+            return
+        nome_topico = ((msg.get("reply_to_message") or {}).get("forum_topic_created") or {}).get("name") \
+                      or f"tópico {thread_id}"
+        ok, resposta = registrar_vinculo(sheets, partes[1], thread_id, nome_topico)
+        enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS, resposta)
+        return
 
     # Comandos de ponto — só no grupo equipe, tópico geral
     if chat_id != GRUPO_EQUIPE:
@@ -973,6 +1212,13 @@ def main():
     print("🚀 Métrica Bot iniciado!")
     drive, sheets = autenticar_google()
     print("✅ Google conectado")
+    global sheets_global
+    sheets_global = sheets
+    try:
+        carregar_vinculos(sheets)
+        carregar_topicos(sheets)
+    except Exception as e:
+        print(f"Erro ao carregar vínculos/tópicos: {e}")
 
     threading.Thread(target=loop_drive, args=(drive, sheets), daemon=True).start()
     threading.Thread(target=loop_webhook, daemon=True).start()
