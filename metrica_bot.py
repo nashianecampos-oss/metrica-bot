@@ -90,6 +90,7 @@ EQUIPE = {
         "carga_diaria_h": None,
         "clickup_id": 296428627,
         "drive_name": "erickbrunol.n",
+        "drive_emails": ["erickmetrica@gmail.com"],
     },
     2048504320: {
         "nome": "Nagia",
@@ -104,6 +105,16 @@ EQUIPE = {
 DRIVE_PARA_TELEGRAM = {
     v["drive_name"]: k for k, v in EQUIPE.items() if v["drive_name"]
 }
+DRIVE_EMAIL_PARA_TELEGRAM = {
+    email.lower(): k for k, v in EQUIPE.items() for email in v.get("drive_emails", [])
+}
+
+def identificar_pessoa_drive(usuario):
+    """Reconhece quem salvou o arquivo: primeiro pelo e-mail da conta Google, depois pelo nome de exibição."""
+    email = (usuario.get("emailAddress") or "").strip().lower()
+    if email in DRIVE_EMAIL_PARA_TELEGRAM:
+        return DRIVE_EMAIL_PARA_TELEGRAM[email]
+    return DRIVE_PARA_TELEGRAM.get(usuario.get("displayName", ""))
 
 ORDEM_PLANILHA = [7615289681, 5777049521, 6488820892, 2048504320]
 COLUNAS_POR_PESSOA = 6
@@ -517,7 +528,7 @@ def loop_aviso_inatividade_drive():
                 continue
             for telegram_id in list(drive_monitorando.keys()):
                 config = EQUIPE.get(telegram_id)
-                if not config or not config.get("drive_name"):
+                if not config or not (config.get("drive_name") or config.get("drive_emails")):
                     continue  # sem conta do Drive mapeada (ex.: Nagia): não dá para monitorar
                 if telegram_id in modo_cliente:
                     continue  # em pasta de cliente (comando /cliente)
@@ -559,7 +570,9 @@ def loop_drive(drive, sheets):
                     continue
                 arquivos_vistos.add(file_id)
                 nome_arquivo = arquivo["name"]
-                modificado_por = arquivo.get("lastModifyingUser", {}).get("displayName", "")
+                usuario_drive = arquivo.get("lastModifyingUser", {})
+                modificado_por = usuario_drive.get("displayName", "")
+                email_drive = usuario_drive.get("emailAddress", "")
                 momento = datetime.fromisoformat(
                     arquivo["modifiedTime"].replace("Z", "+00:00")
                 ).astimezone(MANAUS)
@@ -567,9 +580,9 @@ def loop_drive(drive, sheets):
                 caminho = get_caminho_drive(drive, arquivo.get("parents", []))
 
                 enviar_telegram(GRUPO_PRIVADO, None,
-                               f"📁 *{modificado_por}* salvou\n📂 {caminho}\n📄 {nome_arquivo}\n🕐 {hora}")
+                               f"📁 *{modificado_por}*{f' ({email_drive})' if email_drive else ''} salvou\n📂 {caminho}\n📄 {nome_arquivo}\n🕐 {hora}")
 
-                telegram_id = DRIVE_PARA_TELEGRAM.get(modificado_por)
+                telegram_id = identificar_pessoa_drive(usuario_drive)
                 if telegram_id and telegram_id in drive_monitorando:
                     # Remove do modo cliente se estava lá
                     modo_cliente.discard(telegram_id)
