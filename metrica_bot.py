@@ -76,6 +76,7 @@ EQUIPE = {
         "carga_diaria_h": 6,
         "clickup_id": 75487185,
         "drive_name": "helena.metricabim",
+        "drive_emails": ["helena.metricabim@gmail.com"],
     },
     5777049521: {
         "nome": "Micheli",
@@ -84,6 +85,7 @@ EQUIPE = {
         "carga_diaria_h": 6,
         "clickup_id": 194434554,
         "drive_name": "michelemaria792",
+        "drive_emails": ["michelemaria792@gmail.com"],
     },
     6488820892: {
         "nome": "Erick",
@@ -218,6 +220,75 @@ def recuperar_entrada_extra_hoje(user_id, sheets):
         return agora.replace(hour=hora, minute=minuto, second=0, microsecond=0)
     except:
         return None
+
+# ─── RESTAURAÇÃO DO ESTADO DO DIA (após reinício/deploy) ──────
+def _hora_para_datetime(texto, base):
+    try:
+        h, m = map(int, str(texto).strip().split(":"))
+        return base.replace(hour=h, minute=m, second=0, microsecond=0)
+    except Exception:
+        return None
+
+def ler_registro_do_dia(sheets):
+    """Lê a linha de hoje da planilha: {user_id: {entrada, saida, extra_entrada, extra_saida}} (datetime ou None)."""
+    agora = datetime.now(MANAUS)
+    data_hoje = agora.strftime("%d/%m/%Y")
+    nome_aba = agora.strftime("%m-%Y")
+    r = sheets.spreadsheets().values().get(
+        spreadsheetId=PLANILHA_ID, range=f"'{nome_aba}'!A:A"
+    ).execute()
+    datas = [(l[0] if l else "") for l in r.get("values", [])]
+    if data_hoje not in datas:
+        return {}
+    n = datas.index(data_hoje) + 1
+    r2 = sheets.spreadsheets().values().get(
+        spreadsheetId=PLANILHA_ID, range=f"'{nome_aba}'!A{n}:Z{n}"
+    ).execute()
+    linha = (r2.get("values") or [[]])[0]
+    def cel(i):
+        return linha[i] if i < len(linha) else ""
+    dados = {}
+    for pos, uid in enumerate(ORDEM_PLANILHA):
+        base = 1 + pos * COLUNAS_POR_PESSOA
+        dados[uid] = {
+            "entrada": _hora_para_datetime(cel(base), agora),
+            "saida": _hora_para_datetime(cel(base + 1), agora),
+            "extra_entrada": _hora_para_datetime(cel(base + 3), agora),
+            "extra_saida": _hora_para_datetime(cel(base + 4), agora),
+        }
+    return dados
+
+def restaurar_estado_do_dia(sheets):
+    """Depois de um deploy/reinício, reconstrói da planilha quem está trabalhando, quem já encerrou e quem
+    está em hora extra, para ninguém precisar repetir comandos. Devolve um resumo em texto."""
+    agora = datetime.now(MANAUS)
+    data_hoje = agora.strftime("%d/%m/%Y")
+    resumo = []
+    for uid, d in ler_registro_do_dia(sheets).items():
+        nome = EQUIPE.get(uid, {}).get("nome", str(uid))
+        ent, sai, ex_ent, ex_sai = d["entrada"], d["saida"], d["extra_entrada"], d["extra_saida"]
+        if ent:
+            if sai is None or sai <= ent:      # entrada sem saída (ou nova entrada depois da saída): em expediente
+                registros.setdefault(uid, {}).update({"entrada": ent, "data": data_hoje})
+                drive_monitorando[uid] = True
+                drive_atividades[uid] = {"primeira": {"arquivo": "registrada antes do reinício", "hora": "--:--"},
+                                         "ultima": None}
+                drive_ultimo_ts[uid] = agora    # a contagem de 45 min recomeça agora
+                drive_ultimo_aviso.pop(uid, None)
+                drive_avisos_encerrados.discard(uid)
+                resumo.append(f"{nome}: em expediente desde {ent.strftime('%H:%M')}")
+            else:                               # já encerrou
+                registros.setdefault(uid, {}).update({"data": data_hoje})
+                drive_avisos_encerrados.add(uid)
+                encerrou_hoje.add(uid)
+                resumo.append(f"{nome}: encerrou às {sai.strftime('%H:%M')}")
+        if ex_ent:
+            if ex_sai is None or ex_sai <= ex_ent:
+                registros.setdefault(uid, {}).update({"entrada_extra": ex_ent, "data": data_hoje})
+                resumo.append(f"{nome}: hora extra em andamento desde {ex_ent.strftime('%H:%M')}")
+            else:
+                drive_avisos_encerrados.add(uid)
+    return resumo
 
 # ─── CREDENCIAIS ─────────────────────────────────────────────
 def carregar_credenciais():
@@ -787,9 +858,11 @@ def loop_drive(drive, sheets):
             arquivos = buscar_arquivos_drive(drive, ultimo_check)
             for arquivo in arquivos:
                 file_id = arquivo["id"]
-                if file_id in arquivos_vistos:
+                # chave = arquivo + horário da modificação: cada nova gravação do mesmo arquivo conta como atividade
+                chave_gravacao = f"{file_id}:{arquivo.get('modifiedTime', '')}"
+                if chave_gravacao in arquivos_vistos:
                     continue
-                arquivos_vistos.add(file_id)
+                arquivos_vistos.add(chave_gravacao)
                 nome_arquivo = arquivo["name"]
                 usuario_drive = arquivo.get("lastModifyingUser", {})
                 modificado_por = usuario_drive.get("displayName", "")
@@ -800,10 +873,11 @@ def loop_drive(drive, sheets):
                 hora = momento.strftime("%H:%M")
                 caminho = get_caminho_drive(drive, arquivo.get("parents", []))
 
-                enviar_telegram(GRUPO_PRIVADO, None,
-                               f"📁 *{modificado_por}*{f' ({email_drive})' if email_drive else ''} salvou\n📂 {caminho}\n📄 {nome_arquivo}\n🕐 {hora}")
-
                 telegram_id = identificar_pessoa_drive(usuario_drive)
+                marca_conta = "" if telegram_id else " ❓ conta não vinculada a ninguém da equipe"
+                enviar_telegram(GRUPO_PRIVADO, None,
+                               f"📁 *{modificado_por}*{f' ({email_drive})' if email_drive else ''} salvou{marca_conta}\n📂 {caminho}\n📄 {nome_arquivo}\n🕐 {hora}")
+
                 if telegram_id and telegram_id in drive_monitorando:
                     # Remove do modo cliente se estava lá
                     modo_cliente.discard(telegram_id)
@@ -845,9 +919,8 @@ def loop_drive(drive, sheets):
                                            f"mas você não marcou início. Use /iniciar!")
 
             ultimo_check = agora
-            if len(arquivos_vistos) > 2000:
+            if len(arquivos_vistos) > 5000:
                 arquivos_vistos.clear()
-                encerrou_hoje.clear()
         except Exception as e:
             print(f"Erro drive: {e}")
         time.sleep(60)
@@ -1219,6 +1292,15 @@ def main():
         carregar_topicos(sheets)
     except Exception as e:
         print(f"Erro ao carregar vínculos/tópicos: {e}")
+    try:
+        resumo = restaurar_estado_do_dia(sheets)
+        print("♻️ Estado do dia restaurado:", "; ".join(resumo) if resumo else "nada a restaurar")
+        enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
+                       "♻️ Bot reiniciado às " + datetime.now(MANAUS).strftime("%H:%M") + ". "
+                       + ("Restaurado da planilha:\n" + "\n".join(f"• {x}" for x in resumo) if resumo
+                          else "Nada a restaurar."))
+    except Exception as e:
+        print(f"Erro ao restaurar estado do dia: {e}")
 
     threading.Thread(target=loop_drive, args=(drive, sheets), daemon=True).start()
     threading.Thread(target=loop_webhook, daemon=True).start()
