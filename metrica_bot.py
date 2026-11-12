@@ -6,6 +6,7 @@ import io
 import threading
 import re
 import unicodedata
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
@@ -123,6 +124,7 @@ def identificar_pessoa_drive(usuario):
 ORDEM_PLANILHA = [7615289681, 5777049521, 6488820892, 2048504320]
 COLUNAS_POR_PESSOA = 6
 
+ultimos_eventos_drive = deque(maxlen=15)  # últimos salvamentos que o bot enxergou no Drive (para o /status)
 data_estado = None  # data (dd/mm/aaaa) a que se refere o estado em memória; muda à meia-noite
 registros = {}
 drive_atividades = {}
@@ -801,6 +803,41 @@ def buscar_arquivos_drive(drive, desde):
     ).execute()
     return resultado.get("files", [])
 
+def montar_status():
+    """Resumo do que o bot sabe agora: situação de cada pessoa e os últimos salvamentos que ele viu no Drive."""
+    agora = datetime.now(MANAUS)
+    linhas = [f"📋 *Status do bot* — {agora.strftime('%H:%M')}"]
+    for uid in ORDEM_PLANILHA:
+        cfg = EQUIPE.get(uid)
+        if not cfg or uid == 2048504320:
+            continue
+        partes = []
+        if uid in drive_monitorando:
+            ent = registros.get(uid, {}).get("entrada")
+            partes.append(f"em expediente desde {ent.strftime('%H:%M') if ent else '?'}")
+            ts = drive_ultimo_ts.get(uid)
+            if ts:
+                partes.append(f"última atividade vista {ts.strftime('%H:%M')} ({int((agora - ts).total_seconds() // 60)} min)")
+            if drive_ultimo_aviso.get(uid):
+                partes.append(f"último aviso {drive_ultimo_aviso[uid].strftime('%H:%M')}")
+        elif uid in encerrou_hoje or uid in drive_avisos_encerrados:
+            partes.append("encerrou hoje")
+        else:
+            partes.append("sem expediente ativo")
+        if registros.get(uid, {}).get("entrada_extra"):
+            partes.append("hora extra em andamento")
+        if uid in modo_cliente:
+            partes.append("modo cliente")
+        linhas.append(f"• {cfg['nome']}: " + " | ".join(partes))
+    if ultimos_eventos_drive:
+        linhas.append("\n📁 Últimos salvamentos vistos no Drive:")
+        for ev in list(ultimos_eventos_drive)[-8:][::-1]:
+            quem = EQUIPE[ev["uid"]]["nome"] if ev["uid"] else "❓ NÃO RECONHECIDO"
+            linhas.append(f"{ev['hora']} {quem} ← {_limpar_md(ev['conta'])} · {_limpar_md(ev['arquivo'])[:40]}")
+    else:
+        linhas.append("\n📁 O bot ainda não viu nenhum salvamento no Drive desde que iniciou.")
+    return "\n".join(linhas)
+
 def loop_virada_do_dia():
     """À meia-noite zera todo o estado do dia (quem estava em expediente, hora extra aberta, modo cliente...).
     Avisa a Nagia quem ficou sem /encerrando, para a saída em branco na planilha não passar despercebida."""
@@ -878,8 +915,17 @@ def loop_aviso_inatividade_drive():
                     texto = (f"⚠️ {config['mention']}, ainda sem atividade no Drive (faz {sem_atividade} minutos). "
                              f"Salve o arquivo em que está trabalhando ou use /cliente.")
                 if devido:
+                    primeiro_aviso = ultimo_aviso is None
                     drive_ultimo_aviso[telegram_id] = agora
                     enviar_telegram(GRUPO_EQUIPE, None, texto)
+                    if primeiro_aviso:
+                        ult = drive_atividades.get(telegram_id, {}).get("ultima")
+                        visto = (f"última atividade vista às {ultimo.strftime('%H:%M')}" +
+                                 (f" ({_limpar_md(ult['arquivo'])[-60:]})" if ult else
+                                  " (nenhum salvamento dele visto desde que o monitoramento começou)"))
+                        enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
+                                       f"ℹ️ Cobrança de inatividade enviada a *{config['nome']}*: {visto}. "
+                                       f"Se ele salvou depois disso, mande /status para ver o que o bot enxerga.")
         except Exception as e:
             print(f"Erro aviso inatividade drive: {e}")
 
@@ -887,6 +933,7 @@ def loop_drive(drive, sheets):
     global arquivos_vistos
     ultimo_check = datetime.now(MANAUS)  # ignora histórico anterior ao deploy
     print(f"📁 Drive monitorando a partir de {ultimo_check.strftime('%H:%M')}")
+    primeira_passada = True  # na 1ª consulta só memoriza o que já existia, sem notificar
     while True:
         try:
             agora = datetime.now(MANAUS)
@@ -898,6 +945,8 @@ def loop_drive(drive, sheets):
                 if chave_gravacao in arquivos_vistos:
                     continue
                 arquivos_vistos.add(chave_gravacao)
+                if primeira_passada:
+                    continue
                 nome_arquivo = arquivo["name"]
                 usuario_drive = arquivo.get("lastModifyingUser", {})
                 modificado_por = usuario_drive.get("displayName", "")
@@ -909,6 +958,8 @@ def loop_drive(drive, sheets):
                 caminho = get_caminho_drive(drive, arquivo.get("parents", []))
 
                 telegram_id = identificar_pessoa_drive(usuario_drive)
+                ultimos_eventos_drive.append({"hora": hora, "conta": modificado_por or email_drive or "?",
+                                              "uid": telegram_id, "arquivo": nome_arquivo})
                 marca_conta = "" if telegram_id else " ❓ conta não vinculada a ninguém da equipe"
                 enviar_telegram(GRUPO_PRIVADO, None,
                                f"📁 *{modificado_por}*{f' ({email_drive})' if email_drive else ''} salvou{marca_conta}\n📂 {caminho}\n📄 {nome_arquivo}\n🕐 {hora}")
@@ -953,6 +1004,7 @@ def loop_drive(drive, sheets):
                                            f"⚠️ {mention}, detectei atividade no Drive às {hora} "
                                            f"mas você não marcou início. Use /iniciar!")
 
+            primeira_passada = False
             ultimo_check = agora
             if len(arquivos_vistos) > 5000:
                 arquivos_vistos.clear()
@@ -1050,6 +1102,11 @@ def processar_mensagem(msg, sheets):
     user_id = msg.get("from", {}).get("id")
     chat_id = str(msg.get("chat", {}).get("id", ""))
     thread_id = msg.get("message_thread_id")
+
+    # /status: só a Nagia; a resposta vai para o grupo privado
+    if user_id == 2048504320 and texto.split() and texto.split()[0].split("@")[0].lower() == "/status":
+        enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS, montar_status())
+        return
 
     # Aprende os tópicos do grupo da equipe só lendo as mensagens
     if chat_id == GRUPO_EQUIPE:
