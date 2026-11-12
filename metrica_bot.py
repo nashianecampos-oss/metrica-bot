@@ -123,6 +123,7 @@ def identificar_pessoa_drive(usuario):
 ORDEM_PLANILHA = [7615289681, 5777049521, 6488820892, 2048504320]
 COLUNAS_POR_PESSOA = 6
 
+data_estado = None  # data (dd/mm/aaaa) a que se refere o estado em memória; muda à meia-noite
 registros = {}
 drive_atividades = {}
 drive_monitorando = {}
@@ -800,6 +801,38 @@ def buscar_arquivos_drive(drive, desde):
     ).execute()
     return resultado.get("files", [])
 
+def loop_virada_do_dia():
+    """À meia-noite zera todo o estado do dia (quem estava em expediente, hora extra aberta, modo cliente...).
+    Avisa a Nagia quem ficou sem /encerrando, para a saída em branco na planilha não passar despercebida."""
+    global data_estado
+    while True:
+        time.sleep(60)
+        try:
+            hoje = datetime.now(MANAUS).strftime("%d/%m/%Y")
+            if data_estado is None:
+                data_estado = hoje
+                continue
+            if hoje == data_estado:
+                continue
+            esquecidos = [EQUIPE[u]["nome"] for u in list(drive_monitorando) if u in EQUIPE]
+            extras = [EQUIPE[u]["nome"] for u, d in list(registros.items()) if u in EQUIPE and d.get("entrada_extra")]
+            if esquecidos:
+                enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
+                               f"⚠️ Ficaram sem /encerrando em {data_estado}: {', '.join(esquecidos)}. "
+                               f"A saída desse dia ficou em branco na planilha.")
+            if extras:
+                enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
+                               f"⚠️ Hora extra aberta sem /encerrando extra em {data_estado}: {', '.join(extras)}. "
+                               f"O fim da extra desse dia ficou em branco na planilha.")
+            for estado in (registros, drive_monitorando, drive_ultimo_ts, drive_ultimo_aviso, drive_atividades):
+                estado.clear()
+            for estado in (modo_cliente, encerrou_hoje, drive_avisos_encerrados):
+                estado.clear()
+            data_estado = hoje
+            print(f"🌅 Novo dia ({hoje}): estado anterior zerado")
+        except Exception as e:
+            print(f"Erro na virada do dia: {e}")
+
 def loop_aviso_inatividade_drive():
     """A cada minuto, avisa quem está em expediente e passou 45 min sem salvar arquivo no Drive.
     Depois do primeiro aviso, repete de 5 em 5 min até a pessoa salvar um arquivo (ou usar /cliente
@@ -829,6 +862,8 @@ def loop_aviso_inatividade_drive():
                 ultimo = drive_ultimo_ts.get(telegram_id)
                 if not ultimo:
                     continue
+                if ultimo.date() != agora.date():
+                    continue  # sobra de outro dia: nunca cobrar por isso
                 ultimo_aviso = drive_ultimo_aviso.get(telegram_id)
                 sem_atividade = int((agora - ultimo).total_seconds() // 60)
                 if ultimo_aviso is None:
@@ -1081,7 +1116,8 @@ def processar_mensagem(msg, sheets):
 
     if texto_lower == "/iniciar":
         # Aviso de duplicado
-        if user_id in registros and "entrada" in registros[user_id]:
+        if (user_id in registros and "entrada" in registros[user_id]
+                and registros[user_id]["entrada"].date() == agora.date()):
             hora_entrada = registros[user_id]["entrada"].strftime("%H:%M")
             enviar_telegram(GRUPO_EQUIPE, None,
                            f"⚠️ {mention}, você já iniciou às {hora_entrada}.\n"
@@ -1285,8 +1321,9 @@ def main():
     print("🚀 Métrica Bot iniciado!")
     drive, sheets = autenticar_google()
     print("✅ Google conectado")
-    global sheets_global
+    global sheets_global, data_estado
     sheets_global = sheets
+    data_estado = datetime.now(MANAUS).strftime("%d/%m/%Y")
     try:
         carregar_vinculos(sheets)
         carregar_topicos(sheets)
@@ -1306,6 +1343,7 @@ def main():
     threading.Thread(target=loop_webhook, daemon=True).start()
     threading.Thread(target=loop_verificar_clickup_sem_inicio, args=(sheets,), daemon=True).start()
     threading.Thread(target=loop_aviso_inatividade_drive, daemon=True).start()
+    threading.Thread(target=loop_virada_do_dia, daemon=True).start()
 
     offset = None
     relatorio_enviado = False
