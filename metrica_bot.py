@@ -832,7 +832,12 @@ def montar_status():
     if ultimos_eventos_drive:
         linhas.append("\n📁 Últimos salvamentos vistos no Drive:")
         for ev in list(ultimos_eventos_drive)[-8:][::-1]:
-            quem = EQUIPE[ev["uid"]]["nome"] if ev["uid"] else "❓ NÃO RECONHECIDO"
+            if ev["uid"]:
+                quem = EQUIPE[ev["uid"]]["nome"]
+            elif ev["conta"] == "sem identificação":
+                quem = "👤 SEM AUTOR → " + (", ".join(ev.get("atribuido") or []) or "ninguém creditado")
+            else:
+                quem = "❓ NÃO RECONHECIDO"
             linhas.append(f"{ev['hora']} {quem} ← {_limpar_md(ev['conta'])} · {_limpar_md(ev['arquivo'])[:40]}")
     else:
         linhas.append("\n📁 O bot ainda não viu nenhum salvamento no Drive desde que iniciou.")
@@ -929,6 +934,206 @@ def loop_aviso_inatividade_drive():
         except Exception as e:
             print(f"Erro aviso inatividade drive: {e}")
 
+def eh_arquivo_temporario(nome):
+    """Arquivos de trava/temporários (AutoCAD .dwl/.dwl2, ~$ do Office...) não são salvamentos de trabalho."""
+    n = str(nome).lower()
+    return n.endswith((".dwl", ".dwl2", ".tmp")) or n.startswith("~") or n.startswith(".~lock")
+
+def eh_conta_do_bot(usuario):
+    texto = f"{usuario.get('emailAddress', '')} {usuario.get('displayName', '')}".lower()
+    return bool(usuario.get("me")) or "gserviceaccount.com" in texto
+
+def em_recebidos(caminho):
+    """Pasta 'Recebidos' = arquivos enviados pelo cliente/terceiros, fora do trabalho de produção."""
+    return any(parte.strip().lower() == "recebidos" for parte in str(caminho).split("/"))
+
+# ─── AUTOR PELAS VERSÕES DO ARQUIVO (Drive API: revisions) ─────
+# É de onde o Drive tira o "Modificado por" que aparece nos Detalhes do arquivo.
+_erros_revisoes = {"n": 0}
+
+def autor_via_revisoes(drive, file_id, momento):
+    """Usuário (dict) da versão do arquivo mais próxima de `momento` (até 15 min), se o Drive informar; senão None."""
+    try:
+        melhor, menor = None, None
+        token = None
+        for _ in range(5):   # no máximo 5 páginas de 1000 versões
+            resp = drive.revisions().list(
+                fileId=file_id, pageSize=1000, pageToken=token,
+                fields="nextPageToken, revisions(modifiedTime, lastModifyingUser)"
+            ).execute()
+            for rev in resp.get("revisions", []):
+                u = rev.get("lastModifyingUser") or {}
+                if not (u.get("displayName") or u.get("emailAddress")):
+                    continue
+                t = datetime.fromisoformat(rev["modifiedTime"].replace("Z", "+00:00"))
+                d = abs((t - momento).total_seconds())
+                if d <= 900 and (menor is None or d < menor):
+                    melhor, menor = u, d
+            token = resp.get("nextPageToken")
+            if not token:
+                break
+        return melhor
+    except Exception as e:
+        _erros_revisoes["n"] += 1
+        if _erros_revisoes["n"] <= 3:
+            print(f"Erro ao ler versões de {file_id}: {str(e)[:160]}")
+        return None
+
+# ─── AUTOR VIA "ATIVIDADE DO DRIVE" (Drive Activity API v2) ─────
+# É a fonte do painel "Atividade" do Drive. Usada quando o campo lastModifyingUser vem vazio.
+ABA_CONTAS = "contas"        # aba da planilha: vínculo "people/ID" -> pessoa da equipe
+activity_service = None
+activity_desativada = False
+contas_people = {}           # "people/123..." -> telegram_id
+
+def autenticar_activity():
+    info = carregar_credenciais()
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/drive.activity.readonly"]
+    )
+    return build("driveactivity", "v2", credentials=creds)
+
+def autores_via_atividade(file_id, momento):
+    """Lista dos 'people/ID' que alteraram o arquivo por volta de `momento` (vazia se a API não souber)."""
+    global activity_desativada
+    if not activity_service or activity_desativada:
+        return []
+    try:
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        ini = (momento - timedelta(minutes=10)).astimezone(timezone.utc).strftime(fmt)
+        fim = (momento + timedelta(minutes=10)).astimezone(timezone.utc).strftime(fmt)
+        resp = activity_service.activity().query(body={
+            "itemName": f"items/{file_id}", "pageSize": 10,
+            "filter": f'time >= "{ini}" AND time <= "{fim}"'
+        }).execute()
+        autores = []
+        for atv in resp.get("activities", []):
+            for ator in atv.get("actors", []):
+                u = (ator.get("user") or {}).get("knownUser") or {}
+                if u.get("personName") and not u.get("isCurrentUser") and u["personName"] not in autores:
+                    autores.append(u["personName"])
+        return autores
+    except Exception as e:
+        msg = str(e)
+        if "SERVICE_DISABLED" in msg or "has not been used" in msg or "accessNotConfigured" in msg:
+            activity_desativada = True
+            print("🔎 API de Atividade do Drive desativada no projeto Google")
+            enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
+                           "🔎 Para o bot descobrir quem salvou os arquivos que o Drive não identifica, ative a "
+                           "*Google Drive Activity API* no projeto *metrica-drive-bot*:\n"
+                           "https://console.developers.google.com/apis/api/driveactivity.googleapis.com/overview?project=metrica-drive-bot")
+        else:
+            print(f"Erro na API de Atividade: {msg[:200]}")
+        return []
+
+def carregar_contas(sheets):
+    _garantir_aba_generica(sheets, ABA_CONTAS, ["people_id", "telegram_id", "nome"])
+    r = sheets.spreadsheets().values().get(
+        spreadsheetId=PLANILHA_ID, range=f"'{ABA_CONTAS}'!A2:D1000"
+    ).execute()
+    for linha in r.get("values", []):
+        if len(linha) >= 2 and linha[0] and linha[1]:
+            try:
+                contas_people[linha[0].strip()] = int(linha[1])
+            except ValueError:
+                pass
+    print(f"🪪 {len(contas_people)} conta(s) do Drive vinculada(s) a pessoas")
+
+def salvar_conta(sheets, people_id, uid):
+    contas_people[people_id] = uid
+    _garantir_aba_generica(sheets, ABA_CONTAS, ["people_id", "telegram_id", "nome"])
+    sheets.spreadsheets().values().append(
+        spreadsheetId=PLANILHA_ID, range=f"'{ABA_CONTAS}'!A1",
+        valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+        body={"values": [[people_id, str(uid), EQUIPE.get(uid, {}).get("nome", "")]]}
+    ).execute()
+
+def aprender_conta(sheets, file_id, momento, uid):
+    """Num salvamento em que o Drive INFORMOU quem salvou, descobre o 'people/ID' dessa pessoa na API de Atividade."""
+    if uid in contas_people.values():
+        return
+    autores = autores_via_atividade(file_id, momento)
+    if len(autores) == 1 and autores[0] not in contas_people:   # só aprende se houver um único autor possível
+        try:
+            salvar_conta(sheets, autores[0], uid)
+            print(f"🪪 Conta {autores[0]} vinculada a {EQUIPE[uid]['nome']}")
+        except Exception as e:
+            contas_people[autores[0]] = uid
+            print(f"Erro ao salvar conta: {e}")
+
+# ─── SALVAMENTOS SEM AUTOR: atribuição por projeto ─────────────
+# Quando o Drive não informa quem salvou, descobre-se o responsável pelo projeto da pasta:
+#  1) quem tem o timer do ClickUp rodando numa tarefa da pasta correspondente;
+#  2) quem foi identificado salvando nessa mesma pasta nas últimas horas.
+# Se nenhuma das duas der resposta, ninguém é creditado.
+_cache_timer = {}            # uid -> (instante, (nome_da_pasta_clickup, nome_da_tarefa) ou None)
+dono_recente = {}            # chave da pasta do projeto -> {uid: momento do último salvamento identificado}
+JANELA_DONO_RECENTE_H = 3
+
+def chave_projeto(caminho):
+    partes = [p.strip() for p in str(caminho).split("/") if p.strip()]
+    for i, parte in enumerate(partes):
+        if parte.lower() == "produzidos":
+            return " / ".join(partes[:i])
+    return " / ".join(partes[:3])
+
+def registrar_dono_recente(caminho, uid, momento):
+    dono_recente.setdefault(chave_projeto(caminho), {})[uid] = momento
+
+def projeto_em_andamento(uid):
+    """(pasta do ClickUp, tarefa) em que a pessoa tem o timer rodando agora; resultado guardado 5 min."""
+    agora_s = time.time()
+    cache = _cache_timer.get(uid)
+    if cache and agora_s - cache[0] < 300:
+        return cache[1]
+    resultado = None
+    try:
+        t = clickup_get(f"team/{WORKSPACE_CLICKUP}/time_entries/current?assignee={EQUIPE[uid]['clickup_id']}")
+        dados = t.get("data") or {}
+        tarefa = dados.get("task") if isinstance(dados, dict) else None
+        task_id = tarefa.get("id") if isinstance(tarefa, dict) else None
+        if task_id:
+            completa = clickup_get(f"task/{task_id}")
+            nome_pasta = ""
+            for chave in ("folder", "project"):
+                obj = completa.get(chave) or {}
+                if obj.get("name") and not obj.get("hidden", True):
+                    nome_pasta = obj["name"]
+                    break
+            resultado = (nome_pasta, str(tarefa.get("name", "")))
+    except Exception as e:
+        print(f"Erro ao consultar timer de {uid}: {e}")
+    _cache_timer[uid] = (agora_s, resultado)
+    return resultado
+
+def pasta_clickup_casa_com_caminho(nome_pasta, caminho):
+    alvo = _tokens_nome(nome_pasta, remover_sufixo=False)
+    return len(alvo) >= 2 and alvo <= _tokens_nome(caminho, remover_sufixo=False)
+
+def atribuir_atividade_anonima(caminho, momento):
+    """Credita o salvamento sem autor a quem trabalha naquele projeto. Devolve (nomes, motivo)."""
+    candidatos = [u for u in list(drive_monitorando)
+                  if EQUIPE.get(u, {}).get("clickup_id")
+                  and (EQUIPE[u].get("drive_name") or EQUIPE[u].get("drive_emails"))
+                  and not sem_avisos_de_atividade(u)]
+    escolhidos, motivo = [], ""
+    for u in candidatos:
+        proj = projeto_em_andamento(u)
+        if proj and proj[0] and pasta_clickup_casa_com_caminho(proj[0], caminho):
+            escolhidos.append(u)
+    if escolhidos:
+        motivo = "timer do ClickUp nesta pasta"
+    else:
+        recentes = dono_recente.get(chave_projeto(caminho), {})
+        escolhidos = [u for u in candidatos if u in recentes
+                      and (momento - recentes[u]).total_seconds() <= JANELA_DONO_RECENTE_H * 3600]
+        if escolhidos:
+            motivo = "salvou nesta pasta há pouco"
+    for u in escolhidos:
+        drive_ultimo_ts[u] = max(momento, drive_ultimo_ts.get(u, momento))
+        drive_ultimo_aviso.pop(u, None)
+    return [EQUIPE[u]["nome"] for u in escolhidos], motivo
+
 def loop_drive(drive, sheets):
     global arquivos_vistos
     ultimo_check = datetime.now(MANAUS)  # ignora histórico anterior ao deploy
@@ -938,7 +1143,7 @@ def loop_drive(drive, sheets):
         try:
             agora = datetime.now(MANAUS)
             arquivos = buscar_arquivos_drive(drive, ultimo_check)
-            for arquivo in arquivos:
+            for arquivo in sorted(arquivos, key=lambda a: a.get("modifiedTime", "")):
                 file_id = arquivo["id"]
                 # chave = arquivo + horário da modificação: cada nova gravação do mesmo arquivo conta como atividade
                 chave_gravacao = f"{file_id}:{arquivo.get('modifiedTime', '')}"
@@ -951,18 +1156,65 @@ def loop_drive(drive, sheets):
                 usuario_drive = arquivo.get("lastModifyingUser", {})
                 modificado_por = usuario_drive.get("displayName", "")
                 email_drive = usuario_drive.get("emailAddress", "")
+                if eh_conta_do_bot(usuario_drive) or eh_arquivo_temporario(nome_arquivo):
+                    continue  # escrita do próprio bot (planilha) ou arquivo de trava/temporário: não é atividade
                 momento = datetime.fromisoformat(
                     arquivo["modifiedTime"].replace("Z", "+00:00")
                 ).astimezone(MANAUS)
                 hora = momento.strftime("%H:%M")
                 caminho = get_caminho_drive(drive, arquivo.get("parents", []))
 
+                recebidos = em_recebidos(caminho)
+                anonimo = not (modificado_por or email_drive)   # o Drive não informou quem salvou
+                if anonimo and recebidos:
+                    continue  # terceiros/cliente mexendo em arquivo recebido: ignorar
                 telegram_id = identificar_pessoa_drive(usuario_drive)
-                ultimos_eventos_drive.append({"hora": hora, "conta": modificado_por or email_drive or "?",
-                                              "uid": telegram_id, "arquivo": nome_arquivo})
-                marca_conta = "" if telegram_id else " ❓ conta não vinculada a ninguém da equipe"
-                enviar_telegram(GRUPO_PRIVADO, None,
-                               f"📁 *{modificado_por}*{f' ({email_drive})' if email_drive else ''} salvou{marca_conta}\n📂 {caminho}\n📄 {nome_arquivo}\n🕐 {hora}")
+                nota_atividade = ""
+                autor_conhecido = False   # as versões do arquivo disseram QUEM foi (mesmo que não seja da equipe)
+                if telegram_id and not recebidos:
+                    aprender_conta(sheets, file_id, momento, telegram_id)
+                elif anonimo and not telegram_id:
+                    # 1) versões do arquivo (de onde o Drive tira o "Modificado por"): não exige nenhuma ativação
+                    u_rev = autor_via_revisoes(drive, file_id, momento)
+                    if u_rev:
+                        autor_conhecido = True
+                        telegram_id = identificar_pessoa_drive(u_rev)
+                        quem_rev = u_rev.get("displayName") or u_rev.get("emailAddress")
+                        if telegram_id:
+                            nota_atividade = f" 🔎 autor identificado pelas versões do arquivo: {EQUIPE[telegram_id]['nome']}"
+                        else:
+                            nota_atividade = (f" 🔎 as versões do arquivo indicam {_limpar_md(quem_rev)} "
+                                              f"(conta não vinculada a ninguém da equipe)")
+                    # 2) API de Atividade do Drive (exige ativá-la no Google Cloud)
+                    if not telegram_id and not nota_atividade:
+                        autores = autores_via_atividade(file_id, momento)
+                        if len(autores) == 1 and autores[0] in contas_people:
+                            telegram_id = contas_people[autores[0]]
+                            nota_atividade = f" 🔎 autor identificado pela Atividade do Drive: {EQUIPE[telegram_id]['nome']}"
+                        elif len(autores) == 1:
+                            nota_atividade = f" 🔎 a Atividade do Drive indica {autores[0]} (ainda sem vínculo a ninguém)"
+                creditados, motivo = [], ""
+                if telegram_id and not recebidos:
+                    registrar_dono_recente(caminho, telegram_id, momento)
+                if anonimo and not telegram_id and not autor_conhecido:
+                    # só atribui por projeto quando NINGUÉM soube dizer o autor; conta conhecida de fora da equipe não credita ninguém
+                    creditados, motivo = atribuir_atividade_anonima(caminho, momento)
+                ultimos_eventos_drive.append({"hora": hora, "conta": modificado_por or email_drive or "sem identificação",
+                                              "uid": telegram_id, "arquivo": nome_arquivo, "atribuido": creditados})
+                if telegram_id:
+                    marca_conta = nota_atividade
+                elif anonimo:
+                    marca_conta = " 👤 o Drive não informou quem salvou" + nota_atividade
+                    if creditados:
+                        marca_conta += f"\n✅ atribuído a: {', '.join(creditados)} ({motivo})"
+                    else:
+                        marca_conta += "\n⚠️ sem responsável conhecido para esta pasta: ninguém foi creditado"
+                else:
+                    pid = usuario_drive.get("permissionId", "")
+                    marca_conta = " ❓ conta não vinculada a ninguém da equipe" + (f" (id …{pid[-6:]})" if pid else "")
+                if not recebidos:   # 'Recebidos' não vai para o grupo privado, mas a atividade de quem é da equipe conta
+                    enviar_telegram(GRUPO_PRIVADO, None,
+                                   f"📁 {f'*{modificado_por}*' if modificado_por else 'Alguém'}{f' ({email_drive})' if email_drive else ''} salvou{marca_conta}\n📂 {caminho}\n📄 {nome_arquivo}\n🕐 {hora}")
 
                 if telegram_id and telegram_id in drive_monitorando:
                     # Remove do modo cliente se estava lá
@@ -1102,6 +1354,21 @@ def processar_mensagem(msg, sheets):
     user_id = msg.get("from", {}).get("id")
     chat_id = str(msg.get("chat", {}).get("id", ""))
     thread_id = msg.get("message_thread_id")
+
+    # /conta people/ID Nome: vínculo manual de reserva (só a Nagia)
+    if user_id == 2048504320 and texto.split() and texto.split()[0].split("@")[0].lower() == "/conta":
+        partes = texto.split()
+        alvo = next((u for u, c in EQUIPE.items() if len(partes) >= 3 and c["nome"].lower() == partes[2].lower()), None)
+        if len(partes) < 3 or not partes[1].startswith("people/") or alvo is None:
+            enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
+                           "ℹ️ Use */conta people/ID Nome* (Helena, Micheli ou Erick), com o ID que aparece no aviso.")
+        else:
+            try:
+                salvar_conta(sheets, partes[1], alvo)
+                enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS, f"✅ Conta `{partes[1]}` vinculada a *{EQUIPE[alvo]['nome']}*.")
+            except Exception as e:
+                enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS, f"⚠️ Não consegui salvar o vínculo: {e}")
+        return
 
     # /status: só a Nagia; a resposta vai para o grupo privado
     if user_id == 2048504320 and texto.split() and texto.split()[0].split("@")[0].lower() == "/status":
@@ -1378,8 +1645,13 @@ def main():
     print("🚀 Métrica Bot iniciado!")
     drive, sheets = autenticar_google()
     print("✅ Google conectado")
-    global sheets_global, data_estado
+    global sheets_global, data_estado, activity_service
     sheets_global = sheets
+    try:
+        activity_service = autenticar_activity()
+        carregar_contas(sheets)
+    except Exception as e:
+        print(f"API de Atividade indisponível: {e}")
     data_estado = datetime.now(MANAUS).strftime("%d/%m/%Y")
     try:
         carregar_vinculos(sheets)
