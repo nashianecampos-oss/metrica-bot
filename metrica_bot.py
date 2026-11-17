@@ -1518,30 +1518,6 @@ def processar_mensagem(msg, sheets):
                        f"👤 *{nome}* em pasta de cliente — monitoramento Drive pausado.\n"
                        f"Volta ao normal automaticamente quando salvar arquivo nas pastas internas.")
 
-        if user_id in registros and "entrada_extra" in registros[user_id]:
-            hora_extra = registros[user_id]["entrada_extra"].strftime("%H:%M")
-            enviar_telegram(GRUPO_EQUIPE, None,
-                           f"⚠️ {mention}, sua hora extra já estava iniciada às {hora_extra}.")
-            return
-
-        if user_id not in registros:
-            registros[user_id] = {}
-        registros[user_id]["entrada_extra"] = agora
-        if "data" not in registros[user_id]:
-            registros[user_id]["data"] = agora.strftime("%d/%m/%Y")
-        enviar_telegram(GRUPO_EQUIPE, None, f"⭐ *{nome}* iniciou hora extra às {agora.strftime('%H:%M')}")
-
-        # Salva entrada extra na planilha imediatamente (sobrevive a restart do Railway)
-        try:
-            nome_aba = agora.strftime("%m-%Y")
-            garantir_aba(sheets, nome_aba)
-            linha = get_ou_criar_linha(sheets, nome_aba, agora.strftime("%d/%m/%Y"))
-            pos = ORDEM_PLANILHA.index(user_id)
-            col_extra_entrada = 1 + pos * COLUNAS_POR_PESSOA + 3
-            atualizar_celulas(sheets, nome_aba, linha, col_extra_entrada, [agora.strftime("%H:%M")])
-        except Exception as e:
-            print(f"Erro ao salvar entrada extra: {e}")
-
     elif texto_lower == "/encerrando extra":
         entrada_extra = None
         if user_id in registros and "entrada_extra" in registros[user_id]:
