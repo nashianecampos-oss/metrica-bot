@@ -293,6 +293,38 @@ def restaurar_estado_do_dia(sheets):
                 drive_avisos_encerrados.add(uid)
     return resumo
 
+def recuperar_estado_da_pessoa(user_id, sheets):
+    """Rede de segurança: se o bot perdeu a memória (reinício/deploy) ou a restauração falhou, antes de
+    responder '/iniciar primeiro' confere na planilha se a pessoa já iniciou hoje e reconstrói o estado.
+    Devolve 'ok' (entrada de hoje em memória), 'sem_entrada' (planilha lida e sem entrada em aberto)
+    ou 'erro' (não deu para ler a planilha)."""
+    agora = datetime.now(MANAUS)
+    reg = registros.get(user_id, {})
+    if "entrada" in reg and reg["entrada"].date() == agora.date():
+        return "ok"
+    ultimo_erro = None
+    for tentativa in range(3):
+        try:
+            d = ler_registro_do_dia(sheets).get(user_id)
+            if not d or not d["entrada"]:
+                return "sem_entrada"
+            ent, sai = d["entrada"], d["saida"]
+            if sai is not None and sai > ent:
+                return "sem_entrada"            # já encerrou hoje
+            registros.setdefault(user_id, {}).update({"entrada": ent, "data": agora.strftime("%d/%m/%Y")})
+            drive_monitorando[user_id] = True
+            drive_atividades.setdefault(user_id, {"primeira": None, "ultima": None})
+            drive_ultimo_ts.setdefault(user_id, agora)
+            drive_avisos_encerrados.discard(user_id)
+            encerrou_hoje.discard(user_id)
+            print(f"♻️ Estado de {user_id} recuperado da planilha (entrada {ent.strftime('%H:%M')})")
+            return "ok"
+        except Exception as e:
+            ultimo_erro = e
+            time.sleep(2)
+    print(f"Erro ao recuperar estado de {user_id}: {ultimo_erro}")
+    return "erro"
+
 # ─── CREDENCIAIS ─────────────────────────────────────────────
 def carregar_credenciais():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
@@ -1439,6 +1471,12 @@ def processar_mensagem(msg, sheets):
     texto_lower = texto.lower()
 
     if texto_lower == "/iniciar":
+        # Se o bot reiniciou e perdeu a memória, confere na planilha para não sobrescrever a entrada
+        if recuperar_estado_da_pessoa(user_id, sheets) == "erro" and user_id not in registros:
+            enviar_telegram(GRUPO_EQUIPE, None,
+                           f"⚠️ {mention}, não consegui consultar a planilha agora. "
+                           f"Tente /iniciar de novo em 1 minuto.")
+            return
         # Aviso de duplicado
         if (user_id in registros and "entrada" in registros[user_id]
                 and registros[user_id]["entrada"].date() == agora.date()):
@@ -1481,8 +1519,16 @@ def processar_mensagem(msg, sheets):
         # Aviso de inatividade no Drive (a cada 45 min): feito por loop_aviso_inatividade_drive
 
     elif texto_lower == "/encerrando":
-        if user_id not in registros or "entrada" not in registros[user_id]:
+        situacao = recuperar_estado_da_pessoa(user_id, sheets)
+        if situacao == "erro":
+            enviar_telegram(GRUPO_EQUIPE, None,
+                           f"⚠️ {mention}, não consegui consultar a planilha agora. "
+                           f"Tente /encerrando de novo em 1 minuto.")
+            return
+        if situacao != "ok" or user_id not in registros or "entrada" not in registros[user_id]:
             enviar_telegram(GRUPO_EQUIPE, None, f"⚠️ {mention}, use /iniciar primeiro.")
+            enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
+                           f"🔎 {nome} mandou /encerrando e não há entrada hoje na planilha nem na memória.")
             return
         entrada = registros[user_id]["entrada"]
         minutos_brutos = int((agora - entrada).total_seconds() / 60)
