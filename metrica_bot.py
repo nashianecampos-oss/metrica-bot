@@ -352,6 +352,19 @@ def enviar_telegram(chat_id, thread_id, texto):
         payload["message_thread_id"] = thread_id
     try:
         r = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=20)
+        if r.status_code == 429:
+            try:
+                espera = int(r.json().get("parameters", {}).get("retry_after", 5))
+            except Exception:
+                espera = 5
+            time.sleep(min(espera, 30) + 1)
+            r = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=20)
+        if r.status_code == 400 and "parse" in r.text.lower():
+            # Markdown quebrado (ex.: nome de arquivo com _ ou *): reenvia como texto simples, nunca perde o aviso
+            print(f"Markdown recusado, reenviando sem formatação: {r.text[:120]}")
+            payload.pop("parse_mode", None)
+            payload["text"] = texto.replace("*", "").replace("`", "")
+            r = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=20)
         if r.status_code != 200:
             print(f"Telegram recusou ({r.status_code}) chat={chat_id} thread={thread_id}: {r.text[:200]}")
     except Exception as e:
@@ -1690,6 +1703,24 @@ def main():
     except Exception as e:
         print(f"Erro ao restaurar estado do dia: {e}")
 
+    # ── Reenvio ÚNICO (só vale em 19/11/2026): aviso de encerramento da Helena que não chegou ──
+    try:
+        if datetime.now(MANAUS).strftime("%d/%m/%Y") == "19/11/2026":
+            uid_h = next((u for u, c in EQUIPE.items() if c["nome"].lower() == "helena"), None)
+            d = ler_registro_do_dia(sheets).get(uid_h) if uid_h else None
+            if d and d["entrada"] and d["saida"] and d["saida"] > d["entrada"]:
+                bruto = int((d["saida"] - d["entrada"]).total_seconds() / 60)
+                liq = max(0, bruto - calcular_intervalo(uid_h, bruto))
+                enviar_telegram(GRUPO_EQUIPE, None,
+                               f"👋 *Helena* encerrou às {d['saida'].strftime('%H:%M')}\n"
+                               f"⏱ Trabalhado: *{liq // 60}h{liq % 60:02d}min*\n"
+                               f"_(aviso reenviado: a mensagem original não chegou)_")
+            else:
+                enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
+                               "ℹ️ Reenvio do encerramento da Helena: não há saída dela hoje na planilha, nada enviado.")
+    except Exception as e:
+        print(f"Erro no reenvio do encerramento: {e}")
+
     threading.Thread(target=loop_drive, args=(drive, sheets), daemon=True).start()
     threading.Thread(target=loop_webhook, daemon=True).start()
     threading.Thread(target=loop_verificar_clickup_sem_inicio, args=(sheets,), daemon=True).start()
@@ -1715,7 +1746,19 @@ def main():
                 offset = update["update_id"] + 1
                 msg = update.get("message", {})
                 if msg:
-                    processar_mensagem(msg, sheets)
+                    try:
+                        processar_mensagem(msg, sheets)
+                    except Exception as e:
+                        # Nunca engolir um comando em silêncio: avisa a pessoa e a Nagia
+                        print(f"Erro ao processar mensagem: {e!r}")
+                        txt = (msg.get("text") or "").strip()
+                        if txt.startswith("/") and str(msg.get("chat", {}).get("id", "")) == GRUPO_EQUIPE:
+                            enviar_telegram(GRUPO_EQUIPE, msg.get("message_thread_id"),
+                                           "⚠️ O bot teve um erro ao processar esse comando. Tente de novo em 1 minuto; "
+                                           "a Nagia foi avisada.")
+                            enviar_telegram(GRUPO_PRIVADO, THREAD_RELATORIOS,
+                                           f"🛑 Erro ao processar `{txt[:40]}` de "
+                                           f"{msg.get('from', {}).get('first_name', '?')}: {str(e)[:150]}")
             agora = datetime.now(MANAUS)
             if agora.day == 1 and agora.hour == 8 and agora.minute == 0:
                 if not relatorio_enviado:
